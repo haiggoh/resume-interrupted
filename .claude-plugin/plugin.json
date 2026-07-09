@@ -1,0 +1,9 @@
+{
+  "name": "resume-interrupted",
+  "version": "0.1.0",
+  "description": "Detects when your most recent session was cut off mid-task (a usage/credit limit, a crash, or a dropped connection leaves no chance to note the work was unfinished) and proactively offers to pick up where you left off.",
+  "author": { "name": "Heiko Brantsch" },
+  "homepage": "https://github.com/haiggoh/resume-interrupted",
+  "license": "MIT",
+  "keywords": ["skill", "hook", "sessions", "resume", "continuity", "recovery", "interruption"]
+}
