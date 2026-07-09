@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Framework-free tests for the resume-interrupted detector.
+"""Framework-free tests for the resume-interrupted detector (v0.2.0).
 
-Runs the classify() logic against synthetic transcripts covering the real shapes we
-verified against live data: a limit kill, a stalled prompt, a bare probe, a clean
-session, and an orphaned last-prompt. No third-party deps.
+Covers classify() on the real transcript shapes, plus the two script modes: the auto
+SessionStart banner and the --list browse. No third-party deps.
 
 Usage: python3 tests/test_detect.py
 """
-import os, sys, json, tempfile, importlib.util
+import os, sys, json, tempfile, subprocess, importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-spec = importlib.util.spec_from_file_location(
-    "detect", os.path.join(HERE, "..", "hooks", "detect-interrupted.py"))
+SCRIPT = os.path.join(HERE, "..", "hooks", "detect-interrupted.py")
+spec = importlib.util.spec_from_file_location("detect", SCRIPT)
 detect = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(detect)
 
@@ -22,66 +21,100 @@ failed = 0
 def check(cond, label):
     global passed, failed
     if cond:
-        passed += 1
-        print("  PASS:", label)
+        passed += 1; print("  PASS:", label)
     else:
-        failed += 1
-        print("  FAIL:", label)
+        failed += 1; print("  FAIL:", label)
 
 
-def write(recs):
-    fd, path = tempfile.mkstemp(suffix=".jsonl")
-    with os.fdopen(fd, "w") as fh:
+def U(t):
+    return {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": t}]}}
+
+
+def A(t):
+    return {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": t}]}}
+
+
+def LP(t):
+    return {"type": "last-prompt", "lastPrompt": t}
+
+
+def session(recs, mtime=None):
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "s.jsonl")
+    with open(p, "w") as fh:
         for r in recs:
             fh.write(json.dumps(r) + "\n")
-    return path
+    return p
 
 
-def U(text):
-    return {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+BUDGET = "API Error: Request rejected (429) · Budget has been exceeded!"
+
+print("== classify() shapes ==")
+c = detect.classify(session([U("do it"), A("ok"), A(BUDGET), LP("do it")]))
+check(c["interrupted"] and c["has_work"] and c["reason"] == "limit-kill", "(E) limit kill")
+c = detect.classify(session([U("first"), A("done"), U("one more thing"), LP("one more thing")]))
+check(c["interrupted"] and c["has_work"] and c["reason"] == "stalled", "(S) stalled, with work")
+c = detect.classify(session([U("are we back?"), LP("are we back?")]))
+check(c["interrupted"] and not c["has_work"], "bare probe -> interrupted but no work")
+c = detect.classify(session([U("hi"), A("hi"), U("thanks"), A("np"), LP("thanks")]))
+check((not c["interrupted"]) and c["has_work"], "clean session")
+c = detect.classify(session([U("go"), A("working"), A("done"),
+      {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "<local-command-stdout>x</local-command-stdout>"}]}}, LP("go")]))
+check(not c["interrupted"], "command-stdout tail is not a dangling human prompt")
 
 
-def A(text):
-    return {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
+def run(argv, stdin=""):
+    r = subprocess.run([sys.executable, SCRIPT] + argv, input=stdin,
+                       capture_output=True, text=True)
+    return r.stdout
 
 
-def TR():
-    return {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": "out"}]}}
+def proj_with(files):
+    """files: list of (name, recs, mtime_touch). Returns dir."""
+    d = tempfile.mkdtemp()
+    for name, recs, mt in files:
+        p = os.path.join(d, name)
+        with open(p, "w") as fh:
+            for r in recs:
+                fh.write(json.dumps(r) + "\n")
+        if mt:
+            os.utime(p, (mt, mt))
+    return d
 
 
-def LP(text):
-    return {"type": "last-prompt", "lastPrompt": text}
+WORK = [U("build the thing"), A("starting"), A(BUDGET), LP("build the thing")]
+PROBE = [U("are we back yet?"), LP("are we back yet?")]
+CLEAN = [U("hi"), A("hi"), U("bye"), A("cya"), LP("bye")]
 
+print("\n== auto mode: banner (systemMessage) + additionalContext on interruption ==")
+d = proj_with([("work.jsonl", WORK, 1000), ("probe.jsonl", PROBE, 2000)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+try:
+    o = json.loads(out); ok = bool(o.get("systemMessage")) and "additionalContext" in o.get("hookSpecificOutput", {})
+except Exception:
+    ok = False
+check(ok, "emits systemMessage banner + additionalContext")
 
-print("== (E) limit kill: last assistant turn is the budget error ==")
-p = write([U("do the thing"), A("working on it"),
-           A("API Error: Request rejected (429) · Budget has been exceeded!"), LP("do the thing")])
-intr, work, dang = detect.classify(p)
-check(intr and work, "flagged as interrupted with work")
+print("== auto mode: silent when a clean substantive session is newer (moved on) ==")
+d = proj_with([("work.jsonl", WORK, 1000), ("clean.jsonl", CLEAN, 3000)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+check(out.strip() == "", "silent after a clean substantive session")
 
-print("== (S) stalled: last human prompt unanswered, with prior work ==")
-p = write([U("first task"), A("done"), U("wait, one more thing"), LP("wait, one more thing")])
-intr, work, dang = detect.classify(p)
-check(intr and work, "flagged as interrupted with work")
-check("one more thing" in dang, "dangling prompt captured")
+print("== feature 2: killed bare-probe offer session -> re-asks the original ==")
+d = proj_with([("work.jsonl", WORK, 1000), ("killed-probe.jsonl", PROBE, 2000)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+check(bool(out.strip()) and "build the thing" in out, "re-asks the original work session")
 
-print("== bare probe: unanswered prompt, NO prior assistant work -> has_work False ==")
-p = write([U("are we back yet?"), LP("are we back yet?")])
-intr, work, dang = detect.classify(p)
-check(intr and not work, "interrupted but no work (probe -> will be skipped)")
+print("== --list: shows probes too, marks the recommended substantive one ==")
+d = proj_with([("work.jsonl", WORK, 1000), ("probe.jsonl", PROBE, 2000)])
+out = run(["--list", "--dir", d])
+check("RECOMMENDED" in out, "marks a recommendation")
+check("are we back yet?" in out, "probe prompt shown (transparency)")
+check("[probe]" in out and "[work" in out, "labels work vs probe")
 
-print("== clean session: last human prompt answered ==")
-p = write([U("hello"), A("hi"), U("thanks"), A("you're welcome"), LP("thanks")])
-intr, work, dang = detect.classify(p)
-check((not intr) and work, "not interrupted; has work")
-
-print("== command-output tail is NOT a human prompt (no false positive) ==")
-p = write([U("install it"), A("installing"), A("done"),
-           {"type": "user", "message": {"role": "user",
-            "content": [{"type": "text", "text": "<local-command-stdout>Installed.</local-command-stdout>"}]}},
-           LP("install it")])
-intr, work, dang = detect.classify(p)
-check((not intr) and work, "command-stdout tail treated as clean")
+print("== never blocks: garbage stdin exits cleanly, no output ==")
+out = run([], stdin="not json")
+check(out.strip() == "", "garbage stdin -> no output")
 
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

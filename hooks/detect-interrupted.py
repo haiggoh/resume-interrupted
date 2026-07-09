@@ -1,45 +1,38 @@
 #!/usr/bin/env python3
-"""resume-interrupted — SessionStart hook.
+"""resume-interrupted — interrupted-session detector.
 
-Reads the SessionStart hook JSON on stdin, looks at the MOST RECENT prior session
-in the same project, and — if that session was cut off mid-task — emits a one-line,
-model-facing notice (hookSpecificOutput.additionalContext) so Claude can proactively
-offer to pick up where it left off.
+Two modes:
 
-Why this exists: when a session dies on a usage/credit limit, a crash, or a dropped
-connection, no compute is possible afterward, so nothing can record that the work was
-unfinished. The interruption is therefore invisible to the next session — unless we
-detect it from the transcript.
+  (default, SessionStart hook)  Reads the hook JSON on stdin, looks at the MOST RECENT
+      *substantive* prior session in the same project, and if it was cut off mid-task
+      emits a user-visible banner (systemMessage) + a model-facing notice
+      (hookSpecificOutput.additionalContext) so Claude can offer to resume.
 
-Design guarantees:
-  * Never blocks a session. Any error → print nothing, exit 0.
-  * Zero third-party deps (stdlib only).
-  * Self-denoising: it only looks at your most recent *substantive* session (one with
-    real assistant work), skipping bare "are we back yet?" availability probes. If that
-    session ended cleanly, it stays silent — so once you've done real work since, it
-    stops reminding you.
+  --list [--dir DIR]            Prints ALL interrupted sessions in the project (most
+      recent first), probes included, with the most likely resume candidate marked.
+      For the on-demand "show me everything I haven't picked back up" flow.
 
-Interruption markers (either one):
-  (E) LIMIT KILL  — the last assistant turn is an API/budget error
-                    ("Budget has been exceeded" / "API Error: Request rejected").
-  (S) STALLED     — the final human input (last user record, or an orphaned
-                    last-prompt marker) never received an assistant reply
-                    (covers crashes / dropped connections, or a limit that hit
-                    before any reply was produced).
+Why: a session that dies on a usage/credit limit, a crash, or a dropped connection can't
+record afterward that its work was unfinished. The only trace is the transcript.
+
+Design guarantees: never blocks a session (any error -> print nothing, exit 0); stdlib
+only; reads transcripts, writes nothing.
+
+Detection — a session was interrupted if EITHER:
+  (E) LIMIT KILL  the last assistant turn is an API/budget error.
+  (S) STALLED     the final human input (last user record, or an orphaned last-prompt)
+                  never received an assistant reply.
+
+De-noising: the auto banner considers only the most recent *substantive* session (>=1
+real assistant turn). Bare "are we back yet?" probes are skipped for the recommendation,
+so the offer re-appears after a killed/empty session but goes quiet once a clean
+substantive session exists (i.e. you've moved on). --list still shows probes, for
+transparency, since a "probe" is occasionally a real request typed on a dead connection.
 """
 
 import sys, os, json, glob
 
-# (E) markers. The budget/credit strings are specific to metered gateways; harmless
-# elsewhere (those users simply match (S) instead). Extend for your environment.
 ERROR_SIGNATURES = ("Budget has been exceeded", "API Error: Request rejected", "usage limit reached")
-
-
-def _load_stdin():
-    try:
-        return json.load(sys.stdin)
-    except Exception:
-        return {}
 
 
 def _records(path):
@@ -60,7 +53,6 @@ def _records(path):
 
 
 def _human_text(msg):
-    """Human-authored prompt text, or None for tool results / command output / non-human."""
     c = msg.get("content")
     if isinstance(c, str):
         t = c
@@ -76,7 +68,7 @@ def _human_text(msg):
                 break
     else:
         return None
-    if not t or t.lstrip().startswith("<"):  # e.g. <local-command-stdout>, <command-name>
+    if not t or t.lstrip().startswith("<"):
         return None
     return t.strip()
 
@@ -94,14 +86,14 @@ def _assistant_text(msg):
 
 
 def _norm(s):
-    return " ".join((s or "").split())[:60]
+    return " ".join((s or "").split())
 
 
 def classify(path):
-    """Return (interrupted, has_work, dangling_prompt)."""
+    """Return dict: interrupted, has_work, dangling, reason ('limit-kill'|'stalled'|'')."""
     recs = _records(path)
     if not recs:
-        return (False, False, "")
+        return {"interrupted": False, "has_work": False, "dangling": "", "reason": ""}
     last_prompt = ""
     last_human_idx = -1
     last_assistant_text = None
@@ -121,24 +113,20 @@ def classify(path):
     has_work = work >= 1
     last_human = _human_text(recs[last_human_idx]["message"]) if last_human_idx >= 0 else ""
 
-    # (E) limit kill: the session died on an API/budget error
     if last_assistant_text and any(sig in last_assistant_text for sig in ERROR_SIGNATURES):
-        return (True, has_work, last_prompt or last_human)
-
-    # (S) stalled: the last human prompt never got a reply
+        return {"interrupted": True, "has_work": has_work,
+                "dangling": last_prompt or last_human, "reason": "limit-kill"}
     if last_human_idx >= 0:
         answered = any(recs[j].get("message", {}).get("role") == "assistant"
                        for j in range(last_human_idx + 1, len(recs)))
         if not answered:
-            return (True, has_work, last_human)
-        # (S') orphaned last-prompt: a newer prompt that only reached the last-prompt
-        # marker (interrupted before it became an answered turn).
-        if last_prompt and _norm(last_prompt) != _norm(last_human):
-            return (True, has_work, last_prompt)
+            return {"interrupted": True, "has_work": has_work, "dangling": last_human, "reason": "stalled"}
+        if last_prompt and _norm(last_prompt)[:60] != _norm(last_human)[:60]:
+            return {"interrupted": True, "has_work": has_work, "dangling": last_prompt, "reason": "stalled"}
     elif last_prompt:
-        return (True, has_work, last_prompt)
+        return {"interrupted": True, "has_work": has_work, "dangling": last_prompt, "reason": "stalled"}
 
-    return (False, has_work, "")
+    return {"interrupted": False, "has_work": has_work, "dangling": "", "reason": ""}
 
 
 def _mtime_str(path):
@@ -146,8 +134,90 @@ def _mtime_str(path):
     return datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
 
 
-def main():
-    data = _load_stdin()
+def _prior_files(proj, current_sid):
+    files = [f for f in glob.glob(os.path.join(proj, "*.jsonl"))
+             if os.path.basename(f) != "%s.jsonl" % current_sid]
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files
+
+
+def _recommended(proj, current_sid):
+    """Auto-mode candidate: the most recent SUBSTANTIVE session, iff it was interrupted.
+    A clean substantive session (you moved on) suppresses; a killed/empty one is skipped
+    so the offer re-appears. Returns (path, info) or (None, None)."""
+    for f in _prior_files(proj, current_sid):
+        info = classify(f)
+        if not info["has_work"]:
+            continue
+        return (f, info) if info["interrupted"] else (None, None)
+    return (None, None)
+
+
+def _emit_auto(path, info, others):
+    ts = _mtime_str(path)
+    d = _norm(info["dangling"])[:70]
+    extra = ("" if others <= 0 else
+             " (%d other unanswered prompt%s also exist — ask me to list them.)"
+             % (others, "s" if others != 1 else ""))
+    banner = ("resume-interrupted: your last session (%s) looks interrupted mid-task — the "
+              "request \"%s\" was never completed. Say \"continue\" to pick it up, or ask me "
+              "to list all unresumed sessions." % (ts, d))
+    ctx = ("resume-interrupted: your most recent substantive session (%s) appears to have been "
+           "interrupted mid-task (unanswered prompt or usage-limit/API error), so no note that "
+           "the work was unfinished could be written at the time. Likely dangling request: \"%s\". "
+           "Proactively offer to pick up where it left off — read the tail of that session's "
+           "transcript to recover context, then continue. If the user has clearly moved on, "
+           "mention it once and don't push.%s" % (ts, d, extra))
+    print(json.dumps({"systemMessage": banner,
+                      "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+
+
+def _project_dir_from_cwd():
+    enc = os.getcwd().replace("/", "-").replace(".", "-")
+    return os.path.join(os.path.expanduser("~/.claude/projects"), enc)
+
+
+def _run_list(argv):
+    proj = None
+    if "--dir" in argv:
+        try:
+            proj = argv[argv.index("--dir") + 1]
+        except Exception:
+            proj = None
+    if not proj:
+        proj = _project_dir_from_cwd()
+    if not os.path.isdir(proj):
+        print("No project transcript directory found (%s)." % proj)
+        return
+    rows = []
+    for f in _prior_files(proj, current_sid=""):
+        info = classify(f)
+        if info["interrupted"]:
+            rows.append((f, info))
+    if not rows:
+        print("No interrupted sessions found in this project.")
+        return
+    rec_path = None
+    for f, info in rows:  # rows are newest-first; first substantive interrupted = recommendation
+        if info["has_work"]:
+            rec_path = f
+            break
+    print("Interrupted sessions in this project (most recent first):\n")
+    for f, info in rows:
+        mark = "> RECOMMENDED" if f == rec_path else "             "
+        kind = "work " if info["has_work"] else "probe"
+        d = _norm(info["dangling"])[:80]
+        print("  %s  %s  [%s]  %-10s  \"%s\"" % (mark, _mtime_str(f), kind, info["reason"], d))
+    print("\n  '>' = most likely the one to resume (most recent session with real work).")
+    print("  [work] had substantive work; [probe] only an unanswered prompt — usually a failed")
+    print("  availability check, but shown in case it was a real request typed on a dead connection.")
+
+
+def _run_auto():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        return
     tp = data.get("transcript_path") or ""
     sid = data.get("session_id") or ""
     if not tp:
@@ -155,31 +225,19 @@ def main():
     proj = os.path.dirname(tp)
     if not os.path.isdir(proj):
         return
-    files = [f for f in glob.glob(os.path.join(proj, "*.jsonl"))
-             if os.path.basename(f) != "%s.jsonl" % sid]
-    files.sort(key=os.path.getmtime, reverse=True)
+    path, info = _recommended(proj, sid)
+    if not path:
+        return
+    others = sum(1 for f in _prior_files(proj, sid)
+                 if f != path and classify(f)["interrupted"])
+    _emit_auto(path, info, others)
 
-    # Walk newest -> oldest; stop at the first SUBSTANTIVE session (has real work).
-    # Bare probes (no assistant work) are transparent and skipped.
-    for f in files:
-        interrupted, has_work, dangling = classify(f)
-        if not has_work:
-            continue
-        if interrupted:
-            d = _norm(dangling)
-            notice = (
-                "resume-interrupted: your most recent substantive session (%s) appears to have been "
-                "interrupted mid-task — it ended on an unanswered prompt or a usage-limit/API error, so "
-                "no note that the work was unfinished could be written at the time. Likely dangling "
-                "request: \"%s\". Proactively offer to pick up where it left off: read the tail of that "
-                "session's transcript to recover context, then continue. If the user has clearly moved "
-                "on to something else, mention it once and don't push." % (_mtime_str(f), d)
-            )
-            print(json.dumps({"hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": notice,
-            }}))
-        return  # stop at the most recent substantive session either way
+
+def main():
+    if "--list" in sys.argv:
+        _run_list(sys.argv)
+    else:
+        _run_auto()
 
 
 if __name__ == "__main__":

@@ -11,11 +11,21 @@ cracks. This plugin recovers it from the transcript.
 ## What it does
 
 - A **SessionStart hook** inspects your most recent *substantive* prior session in the
-  current project. If it was interrupted, it injects a one-line notice so Claude can
-  offer to resume — naming the likely dangling request.
+  current project. If it was interrupted, it shows a **user-visible banner** *and* gives
+  Claude the context to offer to resume — naming the likely dangling request.
 - A bundled **skill** (`resume-interrupted`) carries the recovery procedure: locate the
   transcript, read its tail, reconstruct intent, and continue — invoked on the notice or
   whenever you say "continue" / "pick up where we left off".
+- **Browse mode:** ask Claude to "list interrupted sessions" (or run
+  `hooks/detect-interrupted.py --list`) to see *every* unresumed session — most recent
+  first, recommendation marked — so you can jump back into any of them, not just the last.
+
+### Re-offering vs. nagging
+
+The auto-offer is **not** a one-shot. It re-appears each startup while your most recent
+substantive session is interrupted — so if the session that *made* the offer is itself
+killed before you reply, you'll be reminded again. It goes quiet only once you've had a
+clean substantive session (you've moved on). Use browse mode to revisit anything later.
 
 ## How it detects an interruption
 

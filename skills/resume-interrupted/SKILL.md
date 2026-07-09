@@ -1,6 +1,6 @@
 ---
 name: resume-interrupted
-description: Use when a session may have been cut off mid-task — when the user says "continue", "pick up where we left off", "did that finish?", or a SessionStart notice reports an interrupted prior session, or the general sentiment implies unfinished business from a recent session. Recovers context from the transcript and continues the interrupted work.
+description: Use when a session may have been cut off mid-task — when the user says "continue", "pick up where we left off", "did that finish?", asks to list/see which past sessions were interrupted or left unfinished, or a SessionStart notice reports an interrupted prior session, or the general sentiment implies unfinished business from a recent session. Recovers context from the transcript and continues the interrupted work.
 ---
 
 # Resume interrupted work
@@ -52,6 +52,27 @@ is *only* an unanswered prompt has nothing to resume — skip it and look at the
    diving in, so they can confirm or redirect.
 5. **Continue** — pick up the task, or ask one crisp clarifying question if the intent is
    ambiguous. If the user has clearly moved on, mention the unfinished item once and drop it.
+
+## Listing all interrupted sessions (browse & pick)
+
+The SessionStart hook only *auto-offers* the single most likely session, and only until
+you've had a clean working session (it won't nag). When the user wants to see everything
+they might not have picked back up — "what did I leave unfinished?", "list interrupted
+sessions", "show me past sessions to resume" — run the detector in list mode:
+
+```
+python3 "$CLAUDE_PLUGIN_ROOT/hooks/detect-interrupted.py" --list
+```
+
+(Or `--list --dir <project transcripts dir>` to target a specific project.) It prints
+every interrupted session, most recent first, and marks the most likely resume candidate
+with `>`. Present it as a short table and ask which one to jump back into.
+
+**Probe transparency:** sessions whose only content is a single unanswered prompt are
+labelled `[probe]` (usually a failed "are we back yet?" availability check). They're the
+*low-confidence* rows — but **show them anyway**: occasionally the user typed a real
+request assuming the connection was already restored, so a probe can matter. Recommend
+the `[work]` candidate, but surface the probes so the user can spot a lost real request.
 
 ## Guardrails
 
