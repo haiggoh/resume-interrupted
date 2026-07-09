@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Framework-free tests for the resume-interrupted detector (v0.2.0).
+"""Framework-free tests for the resume-interrupted detector (v0.2.1).
 
 Covers classify() on the real transcript shapes, plus the two script modes: the auto
 SessionStart banner and the --list browse. No third-party deps.
@@ -38,6 +38,12 @@ def LP(t):
     return {"type": "last-prompt", "lastPrompt": t}
 
 
+def AERR(t):
+    """Assistant record flagged as a real API error turn (client sets isApiErrorMessage)."""
+    return {"type": "assistant", "isApiErrorMessage": True,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": t}]}}
+
+
 def session(recs, mtime=None):
     d = tempfile.mkdtemp()
     p = os.path.join(d, "s.jsonl")
@@ -61,6 +67,21 @@ check((not c["interrupted"]) and c["has_work"], "clean session")
 c = detect.classify(session([U("go"), A("working"), A("done"),
       {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "<local-command-stdout>x</local-command-stdout>"}]}}, LP("go")]))
 check(not c["interrupted"], "command-stdout tail is not a dangling human prompt")
+
+# Regression (reproduces the f100ee4c false positive): a healthy final turn that DISCUSSES
+# the budget-error phrase mid-text must NOT be read as a limit kill. Before the anchored
+# fix, `"Budget has been exceeded" in text` matched this and flagged a completed session.
+DISCUSS = ("Here's how to tell them apart: a real budget kill ends with a terminal "
+           "`Budget has been exceeded` turn that stops the session, whereas a transient "
+           "429 recovers. The retry countdown alone proves nothing.")
+c = detect.classify(session([U("explain the budget error"), A("sure"), A(DISCUSS), LP("explain the budget error")]))
+check((not c["interrupted"]) and c["has_work"], "final turn that DISCUSSES an error phrase is not a kill")
+# ...and the discussing turn still counts as substantive work (work-undercount fix).
+c = detect.classify(session([U("explain"), A(DISCUSS), LP("explain")]))
+check(c["has_work"], "a lone turn quoting an error phrase counts as real work")
+# Structural marker: isApiErrorMessage alone marks a kill even if the text isn't anchored.
+c = detect.classify(session([U("go"), A("working"), AERR("Overloaded — gave up after 10 retries"), LP("go")]))
+check(c["interrupted"] and c["reason"] == "limit-kill", "isApiErrorMessage flag alone marks a kill")
 
 
 def run(argv, stdin=""):

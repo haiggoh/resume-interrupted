@@ -19,7 +19,10 @@ Design guarantees: never blocks a session (any error -> print nothing, exit 0); 
 only; reads transcripts, writes nothing.
 
 Detection — a session was interrupted if EITHER:
-  (E) LIMIT KILL  the last assistant turn is an API/budget error.
+  (E) LIMIT KILL  the last assistant turn is an API/budget error — recognised by the
+                  transcript's own `isApiErrorMessage` marker, or (fallback) an error
+                  signature at the START of the turn. A turn that merely *discusses* an
+                  error phrase mid-text is NOT a kill.
   (S) STALLED     the final human input (last user record, or an orphaned last-prompt)
                   never received an assistant reply.
 
@@ -89,6 +92,20 @@ def _norm(s):
     return " ".join((s or "").split())
 
 
+def _is_error_turn(rec, text):
+    """True if this assistant record is the API/limit error the session died on.
+
+    Trust the transcript's own structural marker first (`isApiErrorMessage`, set by the
+    client on real error turns). Fall back to an ANCHORED text match — an error signature
+    at the START of the turn — so a healthy turn that merely *quotes* an error phrase
+    mid-paragraph (e.g. documenting how to recognise a budget kill) is not mistaken for
+    one. An unanchored `sig in text` match conflates "died on" with "wrote about".
+    """
+    if rec.get("isApiErrorMessage"):
+        return True
+    return _norm(text).startswith(ERROR_SIGNATURES)
+
+
 def classify(path):
     """Return dict: interrupted, has_work, dangling, reason ('limit-kill'|'stalled'|'')."""
     recs = _records(path)
@@ -96,7 +113,7 @@ def classify(path):
         return {"interrupted": False, "has_work": False, "dangling": "", "reason": ""}
     last_prompt = ""
     last_human_idx = -1
-    last_assistant_text = None
+    last_assistant_is_error = False
     work = 0
     for i, o in enumerate(recs):
         if o.get("type") == "last-prompt":
@@ -107,13 +124,13 @@ def classify(path):
             last_human_idx = i
         elif role == "assistant":
             at = _assistant_text(m)
-            last_assistant_text = at
-            if at and not any(sig in at for sig in ERROR_SIGNATURES):
+            last_assistant_is_error = _is_error_turn(o, at)
+            if at and not last_assistant_is_error:
                 work += 1
     has_work = work >= 1
     last_human = _human_text(recs[last_human_idx]["message"]) if last_human_idx >= 0 else ""
 
-    if last_assistant_text and any(sig in last_assistant_text for sig in ERROR_SIGNATURES):
+    if last_assistant_is_error:
         return {"interrupted": True, "has_work": has_work,
                 "dangling": last_prompt or last_human, "reason": "limit-kill"}
     if last_human_idx >= 0:
