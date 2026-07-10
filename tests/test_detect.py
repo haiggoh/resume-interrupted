@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Framework-free tests for the resume-interrupted detector (v0.2.1).
+"""Framework-free tests for the resume-interrupted detector (v0.2.2).
 
 Covers classify() on the real transcript shapes, plus the two script modes: the auto
 SessionStart banner and the --list browse. No third-party deps.
@@ -82,6 +82,16 @@ check(c["has_work"], "a lone turn quoting an error phrase counts as real work")
 # Structural marker: isApiErrorMessage alone marks a kill even if the text isn't anchored.
 c = detect.classify(session([U("go"), A("working"), AERR("Overloaded — gave up after 10 retries"), LP("go")]))
 check(c["interrupted"] and c["reason"] == "limit-kill", "isApiErrorMessage flag alone marks a kill")
+# apiErrorStatus alone (no isApiErrorMessage, no matching wording) also marks a kill —
+# wording-agnostic structural detection, so error-message changes can't cause a false negative.
+AS = {"type": "assistant", "apiErrorStatus": 429,
+      "message": {"role": "assistant", "content": [{"type": "text", "text": "gateway said no"}]}}
+c = detect.classify(session([U("go"), A("working"), AS, LP("go")]))
+check(c["interrupted"] and c["reason"] == "limit-kill", "apiErrorStatus alone marks a kill (wording-agnostic)")
+# A transient error written mid-session that the session RECOVERED from (a normal turn
+# follows) must NOT be read as a kill — only the LAST assistant turn decides (E).
+c = detect.classify(session([U("go"), AERR("Overloaded"), A("recovered — here's the answer"), LP("go")]))
+check((not c["interrupted"]) and c["has_work"], "recovered mid-session error is not a kill")
 
 
 def run(argv, stdin=""):

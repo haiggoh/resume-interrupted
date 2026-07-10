@@ -101,8 +101,14 @@ def _is_error_turn(rec, text):
     mid-paragraph (e.g. documenting how to recognise a budget kill) is not mistaken for
     one. An unanchored `sig in text` match conflates "died on" with "wrote about".
     """
-    if rec.get("isApiErrorMessage"):
+    # Structural marker first — wording-agnostic. The client tags real error turns with
+    # isApiErrorMessage / apiErrorStatus regardless of the message text, so this keeps
+    # working when the error wording changes (e.g. the budget cap message) and covers
+    # error kinds we never enumerated (overloaded, rate-limit, server error).
+    if rec.get("isApiErrorMessage") or rec.get("apiErrorStatus"):
         return True
+    # Legacy fallback for transcripts/harnesses lacking the marker: an error signature at
+    # the START of the turn (anchored — a turn that merely discusses the phrase is not a kill).
     return _norm(text).startswith(ERROR_SIGNATURES)
 
 

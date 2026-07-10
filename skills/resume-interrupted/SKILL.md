@@ -22,9 +22,11 @@ itself. This skill recovers that context and continues.
 
 A session was interrupted (rather than ended intentionally) if **either**:
 
-- **(E) Limit / API kill** — its last assistant turn is an API/budget error
-  (e.g. `Budget has been exceeded`, `API Error: Request rejected`). The session died
-  trying to respond.
+- **(E) Limit / API kill** — its **last** assistant turn is an API/budget/limit error.
+  The reliable signal is the transcript record's own `isApiErrorMessage` / `apiErrorStatus`
+  marker (wording-agnostic — it survives error-message changes and covers overloaded /
+  rate-limit / server errors), **not** the specific error text. A real kill turn is a short
+  terminal stub; a healthy turn that merely *quotes* an error phrase is NOT a kill.
 - **(S) Stalled** — the final human input never got an assistant reply. Two shapes:
   the last human message has no assistant turn after it, **or** the final prompt exists
   only in a trailing `last-prompt` marker (interrupted before it became an answered turn).
@@ -32,6 +34,15 @@ A session was interrupted (rather than ended intentionally) if **either**:
 Distinguish real interrupted work from a bare **availability probe** ("are we back yet?"):
 a resumable session has **≥1 real assistant turn** before the interruption. A session that
 is *only* an unanswered prompt has nothing to resume — skip it and look at the next.
+
+**Mid-stream kills** (a reply cut off while streaming) need no special rule: a persisted
+assistant turn carries a terminal `stop_reason`, so an interrupted stream generally leaves
+either *no* assistant turn (→ falls to **(S)**) or an error turn (→ **(E)**) — both already
+covered. Do **not** try to detect truncation by missing end-punctuation or incomplete
+words: complete turns routinely end on a colon, a list item, a code fence, a number, or a
+tool call with no trailing text, so prose-shape matching false-positives. If a real
+interrupted-stream transcript ever surfaces, the principled signal is a missing/`null`
+`stop_reason` (deterministic), not prose shape.
 
 ## Recovery procedure
 
@@ -43,10 +54,19 @@ is *only* an unanswered prompt has nothing to resume — skip it and look at the
 2. **Pick the candidate.** Most recent **substantive** session (has real assistant work).
    If it ended cleanly, there's nothing to resume — the user has moved on. If it matches
    (E) or (S), it's the one.
-3. **Read the tail, not the whole file.** The last ~15–30 records hold the final
-   exchange: the dangling prompt, the last thing you were doing, and (for limit kills)
-   the error itself. Each line is a JSON record with `type` / `message.role`, a `content`
-   array (text / tool_use / tool_result), and a `timestamp`.
+3. **Anchor to the end, then walk backward — don't just read a fixed tail.** A fixed
+   line count can open *below* the turn that matters and miss it. Instead find the **last
+   real message turn** (skip `last-prompt`, `system`, and `attachment` artifacts) and read
+   what precedes it. Decide from structure:
+   - last real turn is an **assistant error** (`isApiErrorMessage` / `apiErrorStatus`) → (E);
+   - last real **user** turn with **no assistant turn after it** → (S) stalled;
+   - a trailing `last-prompt` marker is **not** itself a dangling prompt — if the user turn
+     it echoes was already answered, the session is **clean**. It signals a stall only when
+     there is *no* corresponding answered user turn.
+   Each real record has `type` / `message.role`, a `content` array (text / tool_use /
+   tool_result), and a `timestamp`. **Timestamps:** `last-prompt` markers carry **none**,
+   and the file's mtime is *not* the time of any turn — when you cite times to the user,
+   say which is which (file-modified vs turn-occurred) or you'll manufacture contradictions.
 4. **Reconstruct intent.** Identify the unfinished task from the dangling prompt and the
    work that preceded it. Summarize back to the user what looks unfinished *before*
    diving in, so they can confirm or redirect.
