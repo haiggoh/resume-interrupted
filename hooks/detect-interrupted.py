@@ -92,8 +92,10 @@ def _norm(s):
     return " ".join((s or "").split())
 
 
-def _quote(s, n=70):
-    """Trim a dangling prompt for the banner: cap length, cut on a WORD boundary, and mark
+def _quote(s, n=100):
+    """Trim a dangling prompt for the banner: cap length (~100 chars keeps the banner to
+    about one line while giving enough of the prompt to recognise the thread), cut on a
+    WORD boundary, and mark
     truncation with a single '…'. A mid-word cut ("…from a human persp") reads as if the
     text itself were severed — a false signal in a tool whose job is flagging severed
     sessions. Claude Code's own last-prompt marker may already end in '…'; normalise so we

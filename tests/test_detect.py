@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Framework-free tests for the resume-interrupted detector (v0.2.3).
+"""Framework-free tests for the resume-interrupted detector (v0.2.4).
 
 Covers classify() on the real transcript shapes, plus the two script modes: the auto
 SessionStart banner and the --list browse. No third-party deps.
@@ -164,6 +164,7 @@ check(quoted.endswith("…"), "long quote ends with an ellipsis")
 body = quoted.rstrip("… ").rstrip()
 check(bool(body) and LONG.startswith(body) and (len(body) == len(LONG) or LONG[len(body)] == " "),
       "quote cut on a word boundary (prefix ends exactly at a space)")
+check(70 < len(body) <= 100, "quote cap raised to ~100 chars (v0.2.4), still ~one line")
 
 print("== --list: shows probes too, marks the recommended substantive one ==")
 d = proj_with([("work.jsonl", WORK, 1000), ("probe.jsonl", PROBE, 2000)])
