@@ -92,6 +92,23 @@ def _norm(s):
     return " ".join((s or "").split())
 
 
+def _quote(s, n=70):
+    """Trim a dangling prompt for the banner: cap length, cut on a WORD boundary, and mark
+    truncation with a single '…'. A mid-word cut ("…from a human persp") reads as if the
+    text itself were severed — a false signal in a tool whose job is flagging severed
+    sessions. Claude Code's own last-prompt marker may already end in '…'; normalise so we
+    never double it and never lose the truncation cue."""
+    s = _norm(s)
+    upstream_cut = s.endswith("…")
+    core = s[:-1].rstrip() if upstream_cut else s
+    if len(core) <= n:
+        return core + "…" if upstream_cut else core
+    cut = core[:n].rstrip()
+    if " " in cut:
+        cut = cut[:cut.rfind(" ")].rstrip()
+    return cut + "…"
+
+
 def _is_error_turn(rec, text):
     """True if this assistant record is the API/limit error the session died on.
 
@@ -178,13 +195,18 @@ def _recommended(proj, current_sid):
 
 def _emit_auto(path, info, others):
     ts = _mtime_str(path)
-    d = _norm(info["dangling"])[:70]
+    d = _quote(info["dangling"])
     extra = ("" if others <= 0 else
              " (%d other unanswered prompt%s also exist — ask me to list them.)"
              % (others, "s" if others != 1 else ""))
-    banner = ("resume-interrupted: your last session (%s) looks interrupted mid-task — the "
-              "request \"%s\" was never completed. Say \"continue\" to pick it up, or ask me "
-              "to list all unresumed sessions." % (ts, d))
+    # Reason-aware wording: a limit-kill answered the prompt and then died mid-work, so
+    # "the request was never completed" (only true for a stall) would misreport it.
+    if info["reason"] == "limit-kill":
+        lead = "was cut off by a usage/API limit mid-task (last request: \"%s\")" % d
+    else:
+        lead = "left a request unanswered: \"%s\"" % d
+    banner = ("resume-interrupted: your last session (%s) %s. Say \"continue\" to pick it "
+              "up, or ask me to list all unresumed sessions." % (ts, lead))
     ctx = ("resume-interrupted: your most recent substantive session (%s) appears to have been "
            "interrupted mid-task (unanswered prompt or usage-limit/API error), so no note that "
            "the work was unfinished could be written at the time. Likely dangling request: \"%s\". "

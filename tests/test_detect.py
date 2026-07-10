@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Framework-free tests for the resume-interrupted detector (v0.2.2).
+"""Framework-free tests for the resume-interrupted detector (v0.2.3).
 
 Covers classify() on the real transcript shapes, plus the two script modes: the auto
 SessionStart banner and the --list browse. No third-party deps.
@@ -135,6 +135,35 @@ print("== feature 2: killed bare-probe offer session -> re-asks the original =="
 d = proj_with([("work.jsonl", WORK, 1000), ("killed-probe.jsonl", PROBE, 2000)])
 out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
 check(bool(out.strip()) and "build the thing" in out, "re-asks the original work session")
+
+print("\n== v0.2.3: banner wording is reason-aware (E limit-kill vs S stalled) ==")
+# (E) limit-kill: the prompt WAS answered and the session died mid-work afterward, so the
+# banner must NOT claim the request "was never completed" — it must name the usage/API limit.
+d = proj_with([("k.jsonl", WORK, 1000)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+banner = json.loads(out).get("systemMessage", "")
+check("never completed" not in banner and ("limit" in banner.lower() or "api" in banner.lower()),
+      "(E) banner names a usage/API limit, not 'never completed'")
+# (S) stalled: the request genuinely received no reply -> 'unanswered' is the accurate framing.
+STALL = [U("first"), A("done"), U("one more thing"), LP("one more thing")]
+d = proj_with([("s.jsonl", STALL, 1000)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+banner = json.loads(out).get("systemMessage", "")
+check("unanswered" in banner.lower(), "(S) banner says the request was left unanswered")
+
+print("== v0.2.3: a long quote truncates on a word boundary with an ellipsis (no mid-word cut) ==")
+import re
+LONG = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
+        "mike november oscar papa quebec romeo sierra tango")
+d = proj_with([("k.jsonl", [U(LONG), A("ok"), A(BUDGET), LP(LONG)], 1000)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+banner = json.loads(out).get("systemMessage", "")
+quoted = (re.search(r'"([^"]*)"', banner) or re.search(r'(alpha[^"]*)', banner))
+quoted = quoted.group(1) if quoted else ""
+check(quoted.endswith("…"), "long quote ends with an ellipsis")
+body = quoted.rstrip("… ").rstrip()
+check(bool(body) and LONG.startswith(body) and (len(body) == len(LONG) or LONG[len(body)] == " "),
+      "quote cut on a word boundary (prefix ends exactly at a space)")
 
 print("== --list: shows probes too, marks the recommended substantive one ==")
 d = proj_with([("work.jsonl", WORK, 1000), ("probe.jsonl", PROBE, 2000)])
