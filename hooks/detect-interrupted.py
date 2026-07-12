@@ -207,7 +207,7 @@ def _emit_auto(path, info, others):
         lead = "was cut off by a usage/API limit mid-task (last request: \"%s\")" % d
     else:
         lead = "left a request unanswered: \"%s\"" % d
-    banner = ("resume-interrupted: your last session (%s) %s. Say \"continue\" to pick it "
+    banner = ("⚡ resume-interrupted: your last session (%s) %s. Say \"continue\" to pick it "
               "up, or ask me to list all unresumed sessions." % (ts, lead))
     ctx = ("resume-interrupted: your most recent substantive session (%s) appears to have been "
            "interrupted mid-task (unanswered prompt or usage-limit/API error), so no note that "
