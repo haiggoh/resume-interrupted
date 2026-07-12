@@ -45,6 +45,20 @@ skipped, and once you've completed a clean substantive session it goes quiet.
 > they simply never match and detection falls back to the universal `(S)` structural
 > signal. Edit `ERROR_SIGNATURES` in `hooks/detect-interrupted.py` to add your own.
 
+## Relationship to waypoints
+
+A distinct, non-interfering companion to [`waypoints`](https://github.com/haiggoh/waypoints):
+separate plugin, separate store, separate banner label; both SessionStart hooks run independently.
+The two answer different questions:
+
+- **resume-interrupted** — *"was my last session cut off?"* Recovers an **interrupted** session, and
+  **self-denoises** once you've had a clean substantive session.
+- **waypoints** — *"what did I leave open that isn't done yet?"* Carries **deliberate** open to-dos
+  forward and **persists** each until you mark it done (it never self-denoises).
+
+Use them together: resume-interrupted catches the *accidental* loose thread; waypoints tracks the
+*intentional* ones.
+
 ## Install
 
 This plugin is listed in the `haiggoh` marketplace (hosted in the
