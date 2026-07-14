@@ -131,6 +131,59 @@ def _is_error_turn(rec, text):
     return _norm(text).startswith(ERROR_SIGNATURES)
 
 
+# Availability-probe noise the user types into a dead connection ("are we back yet?"). We
+# drop these when harvesting queued notes so real queued work isn't buried. Conservative:
+# only a SHORT message that is (or clearly contains) an availability check is dropped — a
+# real note is never sacrificed to over-eager filtering.
+_PROBE_EXACT = {
+    "", "?", "hi", "hey", "hello", "yo", "test", "ping", "u there", "you there",
+    "anyone", "anyone there", "alive", "still there", "back", "back yet", "we back",
+    "you back", "are we back", "are we back yet", "ready", "working", "working now",
+    "still blocked", "still down", "still stuck", "you up", "up yet", "you alive",
+}
+_PROBE_KEYWORDS = (
+    "back yet", "are we back", "you there", "still there", "still blocked", "still down",
+    "still stuck", "working now", "you up ", "back online", "are you there",
+    "budget back", "unblocked yet", "you alive", "back yet",
+)
+
+
+def _is_probe_text(t):
+    """True if t is an availability probe ('are we back?') rather than a real queued note."""
+    n = _norm(t).lower().rstrip("?!. ")
+    if n in _PROBE_EXACT:
+        return True
+    if len(n) <= 30 and any(k in n for k in _PROBE_KEYWORDS):
+        return True
+    return False
+
+
+def queued_prompts(recs):
+    """Every unanswered human note queued AFTER the last real assistant work turn, de-noised.
+
+    During a usage/limit down phase the user often queues several valuable notes into a
+    blocked session; none get a reply. Harvesting only the trailing prompt (what the banner
+    quotes) loses the earlier ones. So: find the last assistant turn that did real work
+    (non-empty, not an error), then collect every human turn after it, skipping bare
+    availability probes. Order preserved. Returns [] when nothing was queued.
+    """
+    last_work_idx = -1
+    for i, o in enumerate(recs):
+        m = o.get("message", {})
+        if m.get("role") == "assistant":
+            at = _assistant_text(m)
+            if at and not _is_error_turn(o, at):
+                last_work_idx = i
+    out = []
+    for o in recs[last_work_idx + 1:]:
+        m = o.get("message", {})
+        if m.get("role") == "user":
+            t = _human_text(m)
+            if t and not _is_probe_text(t):
+                out.append(t)
+    return out
+
+
 def classify(path):
     """Return dict: interrupted, has_work, dangling, reason ('limit-kill'|'stalled'|'')."""
     recs = _records(path)
@@ -198,23 +251,44 @@ def _recommended(proj, current_sid):
 def _emit_auto(path, info, others):
     ts = _mtime_str(path)
     d = _quote(info["dangling"])
+    queued = queued_prompts(_records(path))
     extra = ("" if others <= 0 else
              " (%d other unanswered prompt%s also exist — ask me to list them.)"
              % (others, "s" if others != 1 else ""))
     # Reason-aware wording: a limit-kill answered the prompt and then died mid-work, so
     # "the request was never completed" (only true for a stall) would misreport it.
     if info["reason"] == "limit-kill":
-        lead = "was cut off by a usage/API limit mid-task (last request: \"%s\")" % d
+        line = "Last session (%s) was cut off by a usage/API limit mid-task." % ts
+        req = "Last request: \"%s\"" % d
     else:
-        lead = "left a request unanswered: \"%s\"" % d
-    banner = ("⚡ resume-interrupted: your last session (%s) %s. Say \"continue\" to pick it "
-              "up, or ask me to list all unresumed sessions." % (ts, lead))
+        line = "Last session (%s) left a request unanswered." % ts
+        req = "Unfinished: \"%s\"" % d
+    # Boxed WARNING banner: a SessionStart hook's systemMessage can't emit ANSI colour, so
+    # prominence comes from box rules + a caps ⚡ header + blank spacing, not colour. Made
+    # visually dominant so it's hard to overlook regardless of where it lands relative to
+    # other plugins' SessionStart lines (cross-plugin ordering isn't controllable here).
+    rule = "━" * 46
+    lines = [rule, "⚡ INTERRUPTED SESSION — likely unfinished work", line, req]
+    if queued:
+        lines.append("＋ %d queued note%s from that session — ask me to surface them."
+                     % (len(queued), "s" if len(queued) != 1 else ""))
+    lines += ["Say \"continue\" to resume, or \"list interrupted\" to browse.", rule]
+    banner = "\n".join(lines)
     ctx = ("resume-interrupted: your most recent substantive session (%s) appears to have been "
            "interrupted mid-task (unanswered prompt or usage-limit/API error), so no note that "
            "the work was unfinished could be written at the time. Likely dangling request: \"%s\". "
            "Proactively offer to pick up where it left off — read the tail of that session's "
            "transcript to recover context, then continue. If the user has clearly moved on, "
            "mention it once and don't push.%s" % (ts, d, extra))
+    if queued:
+        # Keep this universal: surface the lost notes and let the user decide how to keep
+        # them (a follow-up, a to-do, whatever tool they use). Do NOT name a specific
+        # sibling plugin here — this feature stands alone and must work with none installed.
+        ctx += (" That session also has %d earlier note%s queued during the down phase that never "
+                "got a reply — surface these and offer to help the user capture each as a "
+                "follow-up so it isn't lost: %s"
+                % (len(queued), "s" if len(queued) != 1 else "",
+                   "; ".join("\"%s\"" % _norm(q)[:120] for q in queued)))
     print(json.dumps({"systemMessage": banner,
                       "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
@@ -255,6 +329,11 @@ def _run_list(argv):
         kind = "work " if info["has_work"] else "probe"
         d = _norm(info["dangling"])[:80]
         print("  %s  %s  [%s]  %-10s  \"%s\"" % (mark, _mtime_str(f), kind, info["reason"], d))
+        # Surface every note queued into that session during its down phase, so multi-note
+        # queues aren't lost to the single trailing quote above (each is a candidate follow-up).
+        queued = queued_prompts(_records(f))
+        for note in queued:
+            print("                   · queued: \"%s\"" % (_norm(note)[:90]))
     print("\n  '>' = most likely the one to resume (most recent session with real work).")
     print("  [work] had substantive work; [probe] only an unanswered prompt — usually a failed")
     print("  availability check, but shown in case it was a real request typed on a dead connection.")

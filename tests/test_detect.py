@@ -177,5 +177,43 @@ print("== never blocks: garbage stdin exits cleanly, no output ==")
 out = run([], stdin="not json")
 check(out.strip() == "", "garbage stdin -> no output")
 
+print("\n== v0.2.7: banner is a boxed WARNING (rules + caps header), multi-line ==")
+d = proj_with([("k.jsonl", WORK, 1000)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+banner = json.loads(out).get("systemMessage", "")
+check("\n" in banner, "banner is multi-line (boxed)")
+check("━" in banner, "banner has a horizontal rule")
+check("INTERRUPTED SESSION" in banner, "banner has a caps header")
+check("⚡" in banner, "banner keeps the ⚡ identity mark")
+# reason-awareness + quoting preserved under the new layout
+check("never completed" not in banner and ("limit" in banner.lower() or "api" in banner.lower()),
+      "(E) boxed banner still names a usage/API limit")
+check(bool(re.search(r'"[^"]+"', banner)), "boxed banner still quotes the dangling prompt")
+
+print("\n== v0.2.7: queued_prompts harvests ALL unanswered notes (skips probe noise) ==")
+Q = [U("build the thing"), A("starting"),
+     U("also add logging"), U("are we back yet?"), U("and write the docs"), U("still there?"),
+     LP("still there?")]
+check(detect.queued_prompts(Q) == ["also add logging", "and write the docs"],
+      "harvests both real queued notes in order, drops probes")
+check(detect.queued_prompts([U("are we back?"), LP("are we back?")]) == [],
+      "pure probe session -> no queued notes")
+check(detect.queued_prompts([U("hi"), A("hi"), U("bye"), A("cya")]) == [],
+      "clean answered session -> no queued notes")
+QK = [U("build"), A("starting"), AERR(BUDGET), U("note one"), AERR(BUDGET), U("note two"), LP("note two")]
+check(detect.queued_prompts(QK) == ["note one", "note two"],
+      "harvests notes interleaved with limit-kill error turns")
+
+print("== v0.2.7: --list surfaces every queued note for promotion ==")
+d = proj_with([("multi.jsonl", Q, 1000)])
+out = run(["--list", "--dir", d])
+check("also add logging" in out and "and write the docs" in out, "--list shows all queued notes")
+
+print("== v0.2.7: auto additionalContext carries the queued notes ==")
+d = proj_with([("multi.jsonl", Q, 1000)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+ctx = json.loads(out).get("hookSpecificOutput", {}).get("additionalContext", "")
+check("also add logging" in ctx and "and write the docs" in ctx, "additionalContext lists queued notes for promotion")
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
