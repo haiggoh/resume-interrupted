@@ -194,6 +194,29 @@ def queued_prompts(recs):
     return out
 
 
+def _is_stale_last_prompt(recs, last_prompt):
+    """True if last_prompt merely echoes an EARLIER human turn that already received an
+    assistant reply, rather than genuinely new, unanswered input.
+
+    Claude Code's last-prompt marker tracks the last plain-text prompt but isn't refreshed
+    by slash-command/skill invocations — so after a command round-trips cleanly, the file
+    can still end with one or more last-prompt records echoing the prompt from BEFORE that
+    command, making an already-answered session look like it has fresh dangling input.
+    """
+    norm_lp = _norm(last_prompt)[:60]
+    if not norm_lp:
+        return False
+    for i, o in enumerate(recs):
+        m = o.get("message", {})
+        if m.get("role") != "user":
+            continue
+        t = _human_text(m)
+        if t and _norm(t)[:60] == norm_lp:
+            if any(recs[j].get("message", {}).get("role") == "assistant" for j in range(i + 1, len(recs))):
+                return True
+    return False
+
+
 def classify(path):
     """Return dict: interrupted, has_work, dangling, reason ('limit-kill'|'stalled'|'')."""
     recs = _records(path)
@@ -226,9 +249,10 @@ def classify(path):
                        for j in range(last_human_idx + 1, len(recs)))
         if not answered:
             return {"interrupted": True, "has_work": has_work, "dangling": last_human, "reason": "stalled"}
-        if last_prompt and _norm(last_prompt)[:60] != _norm(last_human)[:60]:
+        if (last_prompt and _norm(last_prompt)[:60] != _norm(last_human)[:60]
+                and not _is_stale_last_prompt(recs, last_prompt)):
             return {"interrupted": True, "has_work": has_work, "dangling": last_prompt, "reason": "stalled"}
-    elif last_prompt:
+    elif last_prompt and not _is_stale_last_prompt(recs, last_prompt):
         return {"interrupted": True, "has_work": has_work, "dangling": last_prompt, "reason": "stalled"}
 
     return {"interrupted": False, "has_work": has_work, "dangling": "", "reason": ""}

@@ -88,6 +88,26 @@ AS = {"type": "assistant", "apiErrorStatus": 429,
       "message": {"role": "assistant", "content": [{"type": "text", "text": "gateway said no"}]}}
 c = detect.classify(session([U("go"), A("working"), AS, LP("go")]))
 check(c["interrupted"] and c["reason"] == "limit-kill", "apiErrorStatus alone marks a kill (wording-agnostic)")
+
+# Regression (2026-07-15 false positive): a plain "wrap" prompt gets answered, but the
+# reply invokes a skill, which is delivered as a role=user turn with a "Base directory
+# for this skill: ..." preamble. Claude Code's last-prompt marker isn't refreshed by that
+# skill turn, so it still echoes the ORIGINAL "wrap" text after the reply completes.
+# Before the fix, comparing that stale last-prompt against the skill-preamble "last human
+# text" (which differs) falsely reported a fresh, unanswered dangler.
+SKILL_BODY = "Base directory for this skill: /plugins/cache/some-skill\n\n# Some skill\nBody text..."
+c = detect.classify(session([
+    U("wrap"), LP("wrap"), U(SKILL_BODY), LP("wrap"), A("Wrap-up complete: did the thing."), LP("wrap"),
+]))
+check(not c["interrupted"], "stale last-prompt echo after an answered skill turn is not a fresh dangler")
+# But a GENUINE stall must still be caught: the user re-invokes a skill and the session
+# dies before any reply — even though last-prompt still echoes an older, already-answered
+# prompt from earlier in the session (same staleness quirk, opposite outcome).
+c = detect.classify(session([
+    U("wrap"), A("done with wrap"), LP("do something else"),
+    U(SKILL_BODY), LP("do something else"),
+]))
+check(c["interrupted"] and c["reason"] == "stalled", "genuine stall after a skill re-invocation is still caught")
 # A transient error written mid-session that the session RECOVERED from (a normal turn
 # follows) must NOT be read as a kill — only the LAST assistant turn decides (E).
 c = detect.classify(session([U("go"), AERR("Overloaded"), A("recovered — here's the answer"), LP("go")]))
