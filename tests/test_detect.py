@@ -215,5 +215,27 @@ out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"),
 ctx = json.loads(out).get("hookSpecificOutput", {}).get("additionalContext", "")
 check("also add logging" in ctx and "and write the docs" in ctx, "additionalContext lists queued notes for promotion")
 
+print("\n== v0.2.8: cross-plugin banner-order flag (optional, one-way signal) ==")
+flag_root = tempfile.mkdtemp()
+os.environ["TMPDIR"] = flag_root
+
+
+def flag_path(sid):
+    return os.path.join(flag_root, "claude-sessionstart-banners", "%s.resume-interrupted.done" % sid)
+
+
+d = proj_with([("clean.jsonl", CLEAN, 1000)])
+run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "sid-clean"}))
+check(os.path.exists(flag_path("sid-clean")), "flag written even when there's nothing to print")
+check("printed=0" in open(flag_path("sid-clean")).read(), "flag records printed=0 when banner was skipped")
+
+d = proj_with([("work.jsonl", WORK, 1000)])
+run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "sid-work"}))
+check(os.path.exists(flag_path("sid-work")), "flag written when a banner is printed")
+check("printed=1" in open(flag_path("sid-work")).read(), "flag records printed=1 when banner was printed")
+
+run([], stdin="not json")
+check(not os.path.exists(flag_path("")), "unparseable stdin writes no flag (no session id to key on)")
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

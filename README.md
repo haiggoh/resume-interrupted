@@ -47,9 +47,9 @@ skipped, and once you've completed a clean substantive session it goes quiet.
 
 ## Relationship to waypoints
 
-A distinct, non-interfering companion to [`waypoints`](https://github.com/haiggoh/waypoints):
-separate plugin, separate store, separate banner label; both SessionStart hooks run independently.
-The two answer different questions:
+A distinct companion to [`waypoints`](https://github.com/haiggoh/waypoints): separate plugin,
+separate store, separate banner label; no code-level dependency either way. The two answer
+different questions:
 
 - **resume-interrupted** — *"was my last session cut off?"* Recovers an **interrupted** session, and
   **self-denoises** once you've had a clean substantive session.
@@ -58,6 +58,13 @@ The two answer different questions:
 
 Use them together: resume-interrupted catches the *accidental* loose thread; waypoints tracks the
 *intentional* ones.
+
+**Optional banner ordering:** after deciding whether to print, this hook always writes a
+session-scoped "done" flag to `$TMPDIR-or-/tmp/claude-sessionstart-banners/<session_id>.resume-interrupted.done`.
+Any other plugin's SessionStart hook may poll for that file (with its own short, bounded timeout)
+to sequence its own banner after this one — resume-interrupted itself never checks for or waits on
+anything from the other side. waypoints does exactly this, so resume-interrupted's banner (when it
+has one) reliably lands before waypoints'.
 
 ## Install
 

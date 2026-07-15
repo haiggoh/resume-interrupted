@@ -16,7 +16,17 @@ Why: a session that dies on a usage/credit limit, a crash, or a dropped connecti
 record afterward that its work was unfinished. The only trace is the transcript.
 
 Design guarantees: never blocks a session (any error -> print nothing, exit 0); stdlib
-only; reads transcripts, writes nothing.
+only; reads transcripts.
+
+Optional cross-plugin coordination: after deciding whether to print a banner, this hook
+writes a session-scoped "done" flag to
+`$TMPDIR-or-/tmp/claude-sessionstart-banners/<session_id>.resume-interrupted.done`
+— always, whether or not it printed. Any OTHER plugin's SessionStart hook may poll for
+that file (with its own short, bounded timeout) to sequence its own banner after this
+one, without resume-interrupted knowing or caring that the other plugin exists. This is
+a one-way, best-effort, presence-only signal (file existing = "I'm done deciding this
+session") — never a dependency in the other direction, and never something this hook
+waits on itself.
 
 Detection — a session was interrupted if EITHER:
   (E) LIMIT KILL  the last assistant turn is an API/budget error — recognised by the
@@ -342,24 +352,53 @@ def _run_list(argv):
     print("  availability check, but shown in case it was a real request typed on a dead connection.")
 
 
-def _run_auto():
+def _banner_flag_dir():
+    return os.path.join(os.environ.get("TMPDIR") or os.environ.get("XDG_RUNTIME_DIR")
+                         or "/tmp", "claude-sessionstart-banners")
+
+
+def _signal_done(sid, printed):
+    """Best-effort, session-scoped 'I'm done deciding' flag for any OTHER plugin's
+    SessionStart hook to optionally poll on. Never raises; never blocks; sid-less
+    sessions (unparseable stdin) get no flag, since nothing could key on them anyway."""
+    if not sid:
+        return
     try:
-        data = json.load(sys.stdin)
+        d = _banner_flag_dir()
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        path = os.path.join(d, "%s.resume-interrupted.done" % sid)
+        tmp = path + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as f:
+            f.write("producer=resume-interrupted printed=%d\n" % (1 if printed else 0))
+        os.replace(tmp, path)
     except Exception:
-        return
-    tp = data.get("transcript_path") or ""
-    sid = data.get("session_id") or ""
-    if not tp:
-        return
-    proj = os.path.dirname(tp)
-    if not os.path.isdir(proj):
-        return
-    path, info = _recommended(proj, sid)
-    if not path:
-        return
-    others = sum(1 for f in _prior_files(proj, sid)
-                 if f != path and classify(f)["interrupted"])
-    _emit_auto(path, info, others)
+        pass
+
+
+def _run_auto():
+    sid = ""
+    printed = False
+    try:
+        try:
+            data = json.load(sys.stdin)
+        except Exception:
+            return
+        tp = data.get("transcript_path") or ""
+        sid = data.get("session_id") or ""
+        if not tp:
+            return
+        proj = os.path.dirname(tp)
+        if not os.path.isdir(proj):
+            return
+        path, info = _recommended(proj, sid)
+        if not path:
+            return
+        others = sum(1 for f in _prior_files(proj, sid)
+                     if f != path and classify(f)["interrupted"])
+        _emit_auto(path, info, others)
+        printed = True
+    finally:
+        _signal_done(sid, printed)
 
 
 def main():
