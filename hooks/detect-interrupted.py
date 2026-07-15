@@ -267,8 +267,11 @@ def _emit_auto(path, info, others):
     # prominence comes from box rules + a caps ⚡ header + blank spacing, not colour. Made
     # visually dominant so it's hard to overlook regardless of where it lands relative to
     # other plugins' SessionStart lines (cross-plugin ordering isn't controllable here).
+    # U+26A1 defaults to TEXT presentation without an explicit VS16 (U+FE0F) suffix, so most
+    # terminals render it as a plain glyph, not the colour emoji — unlike waypoints' U+1F9ED,
+    # which defaults to emoji presentation on its own.
     rule = "━" * 46
-    lines = [rule, "⚡ INTERRUPTED SESSION — likely unfinished work", line, req]
+    lines = [rule, "⚡️ INTERRUPTED SESSION — likely unfinished work", line, req]
     if queued:
         lines.append("＋ %d queued note%s from that session — ask me to surface them."
                      % (len(queued), "s" if len(queued) != 1 else ""))
