@@ -18,15 +18,24 @@ record afterward that its work was unfinished. The only trace is the transcript.
 Design guarantees: never blocks a session (any error -> print nothing, exit 0); stdlib
 only; reads transcripts.
 
-Optional cross-plugin coordination: after deciding whether to print a banner, this hook
-writes a session-scoped "done" flag to
+Optional cross-plugin coordination, downstream: after deciding whether to print a
+banner, this hook writes a session-scoped "done" flag to
 `$TMPDIR-or-/tmp/claude-sessionstart-banners/<session_id>.resume-interrupted.done`
 — always, whether or not it printed. Any OTHER plugin's SessionStart hook may poll for
 that file (with its own short, bounded timeout) to sequence its own banner after this
-one, without resume-interrupted knowing or caring that the other plugin exists. This is
-a one-way, best-effort, presence-only signal (file existing = "I'm done deciding this
-session") — never a dependency in the other direction, and never something this hook
-waits on itself.
+one (waypoints does this), without resume-interrupted knowing or caring that the other
+plugin exists. One-way, best-effort, presence-only.
+
+Optional cross-plugin coordination, upstream: symmetrically, if no-hidden-changes is
+installed AND enabled (checked via ~/.claude/settings.json's `enabledPlugins`, never a
+code import), this hook briefly polls no-hidden-changes' own analogous flag
+(`<session_id>.no-hidden-changes.done`) before deciding its own banner — so
+no-hidden-changes' banner (meant to read as the most foundational/always-on notice)
+lands first, this one second, and waypoints' (via the downstream flag above) third.
+Waiting is capped at BANNER_WAIT_S and always falls through regardless of whether the
+flag showed up — this hook must never suppress or meaningfully delay its own banner
+just because no-hidden-changes is slow, absent, or the flag format changes. If
+no-hidden-changes isn't installed/enabled, no wait happens at all.
 
 Detection — a session was interrupted if EITHER:
   (E) LIMIT KILL  the last assistant turn is an API/budget error — recognised by the
@@ -43,7 +52,7 @@ substantive session exists (i.e. you've moved on). --list still shows probes, fo
 transparency, since a "probe" is occasionally a real request typed on a dead connection.
 """
 
-import sys, os, json, glob
+import sys, os, json, glob, time
 
 ERROR_SIGNATURES = ("Budget has been exceeded", "API Error: Request rejected", "usage limit reached")
 
@@ -381,6 +390,43 @@ def _banner_flag_dir():
                          or "/tmp", "claude-sessionstart-banners")
 
 
+BANNER_WAIT_S = float(os.environ.get("RESUME_INTERRUPTED_BANNER_WAIT_S") or 0.75)
+BANNER_POLL_S = float(os.environ.get("RESUME_INTERRUPTED_BANNER_POLL_S") or 0.05)
+
+
+def _settings_path():
+    return os.environ.get("CLAUDE_SETTINGS_FILE") or os.path.expanduser(
+        "~/.claude/settings.json")
+
+
+def _plugin_enabled(slug_prefix):
+    """True if any `enabledPlugins` key like '<slug_prefix>@<marketplace>' is truthy.
+    Never raises — a missing/malformed settings file just means 'not detected'."""
+    try:
+        import re
+        with open(_settings_path()) as f:
+            settings = json.load(f)
+        enabled = settings.get("enabledPlugins") or {}
+        pat = re.compile(r"^%s@" % re.escape(slug_prefix))
+        return any(pat.match(k) and v for k, v in enabled.items())
+    except Exception:
+        return False
+
+
+def _wait_for_no_hidden_changes(sid):
+    """Presence-only poll for no-hidden-changes' done flag, bounded by BANNER_WAIT_S.
+    Content is never parsed — a malformed/stale flag can't cause a false wait, only its
+    mere existence matters. No-op if sid is empty or no-hidden-changes isn't enabled."""
+    if not sid or not _plugin_enabled("no-hidden-changes"):
+        return
+    flag = os.path.join(_banner_flag_dir(), "%s.no-hidden-changes.done" % sid)
+    deadline = time.monotonic() + BANNER_WAIT_S
+    while time.monotonic() < deadline:
+        if os.path.exists(flag):
+            return
+        time.sleep(BANNER_POLL_S)
+
+
 def _signal_done(sid, printed):
     """Best-effort, session-scoped 'I'm done deciding' flag for any OTHER plugin's
     SessionStart hook to optionally poll on. Never raises; never blocks; sid-less
@@ -409,6 +455,7 @@ def _run_auto():
             return
         tp = data.get("transcript_path") or ""
         sid = data.get("session_id") or ""
+        _wait_for_no_hidden_changes(sid)
         if not tp:
             return
         proj = os.path.dirname(tp)

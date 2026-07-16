@@ -257,5 +257,53 @@ check("printed=1" in open(flag_path("sid-work")).read(), "flag records printed=1
 run([], stdin="not json")
 check(not os.path.exists(flag_path("")), "unparseable stdin writes no flag (no session id to key on)")
 
+print("\n== v0.2.9: upstream wait on no-hidden-changes' flag (symmetric, one-way, bounded) ==")
+settings_dir = tempfile.mkdtemp()
+os.environ["CLAUDE_SETTINGS_FILE"] = os.path.join(settings_dir, "settings.json")
+os.environ["RESUME_INTERRUPTED_BANNER_WAIT_S"] = "0.3"
+os.environ["RESUME_INTERRUPTED_BANNER_POLL_S"] = "0.02"
+
+
+def nhc_flag_path(sid):
+    return os.path.join(flag_root, "claude-sessionstart-banners", "%s.no-hidden-changes.done" % sid)
+
+
+def write_settings(enabled):
+    with open(os.environ["CLAUDE_SETTINGS_FILE"], "w") as fh:
+        json.dump({"enabledPlugins": {"no-hidden-changes@haiggoh": True} if enabled else {}}, fh)
+
+
+write_settings(enabled=False)
+check(not detect._plugin_enabled("no-hidden-changes"), "_plugin_enabled: false when not in enabledPlugins")
+write_settings(enabled=True)
+check(detect._plugin_enabled("no-hidden-changes"), "_plugin_enabled: true when '<slug>@marketplace' is truthy")
+os.environ["CLAUDE_SETTINGS_FILE"] = os.path.join(settings_dir, "missing.json")
+check(not detect._plugin_enabled("no-hidden-changes"), "_plugin_enabled: missing settings file fails closed, never raises")
+os.environ["CLAUDE_SETTINGS_FILE"] = os.path.join(settings_dir, "settings.json")
+
+write_settings(enabled=True)
+sid = "sid-upstream-present"
+os.makedirs(os.path.dirname(nhc_flag_path(sid)), exist_ok=True)
+open(nhc_flag_path(sid), "w").write("producer=no-hidden-changes\n")
+t0 = __import__("time").monotonic()
+detect._wait_for_no_hidden_changes(sid)
+check(__import__("time").monotonic() - t0 < 0.25, "flag already present -> returns near-instantly, no full wait")
+
+write_settings(enabled=True)
+sid = "sid-upstream-absent"
+t0 = __import__("time").monotonic()
+detect._wait_for_no_hidden_changes(sid)
+elapsed = __import__("time").monotonic() - t0
+check(0.25 <= elapsed < 1.0, "flag never appears -> waits out BANNER_WAIT_S then falls through (no hang)")
+
+write_settings(enabled=False)
+sid = "sid-upstream-disabled"
+t0 = __import__("time").monotonic()
+detect._wait_for_no_hidden_changes(sid)
+check(__import__("time").monotonic() - t0 < 0.1, "no-hidden-changes not enabled -> no wait at all")
+
+detect._wait_for_no_hidden_changes("")
+check(True, "empty session id -> no-op, never raises")
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

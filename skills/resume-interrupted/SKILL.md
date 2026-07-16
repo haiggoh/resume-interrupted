@@ -67,9 +67,19 @@ interrupted-stream transcript ever surfaces, the principled signal is a missing/
    tool_result), and a `timestamp`. **Timestamps:** `last-prompt` markers carry **none**,
    and the file's mtime is *not* the time of any turn — when you cite times to the user,
    say which is which (file-modified vs turn-occurred) or you'll manufacture contradictions.
-4. **Reconstruct intent.** Identify the unfinished task from the dangling prompt and the
-   work that preceded it. Summarize back to the user what looks unfinished *before*
-   diving in, so they can confirm or redirect.
+4. **Reconstruct intent — read back AT LEAST 3 real turns before the interruption point,
+   not just the dangling prompt itself.** A single trailing user message is not the full
+   picture: it can be a *queued* note sent during the down-phase while an earlier action
+   was still in flight, and the thing that actually needs redoing is that earlier action —
+   not the note. Walk back through the preceding tool_use/tool_result/text turns until you
+   can answer: what was the assistant actually doing right before the interruption, did
+   any tool_use call fail to complete (a blocked/errored tool_result, a call with no
+   matching result, a transient "temporarily unavailable" bounce), and could redoing the
+   wrong thing or skipping the real unfinished step risk lost work, a half-applied edit, or
+   data corruption? If 3 turns back still doesn't reach a clear picture, keep walking
+   further — 3 is a floor, not a cap. Summarize what's unfinished (including any
+   in-flight/aborted action found this way) back to the user *before* diving in, so they
+   can confirm or redirect.
 5. **Continue** — pick up the task, or ask one crisp clarifying question if the intent is
    ambiguous. If the user has clearly moved on, mention the unfinished item once and drop it.
 
@@ -98,6 +108,9 @@ the `[work]` candidate, but surface the probes so the user can spot a lost real 
 
 - **Verify, don't assume.** Confirm the interruption from the transcript before asserting
   it; never tell the user "there's nothing to resume" without looking.
-- **Read excerpts, not entire large transcripts** — the tail is almost always enough.
+- **Read excerpts, not entire large transcripts** — but the excerpt must cover at least
+  the last 3 real turns before the interruption (step 4), not just the single last one.
+  A fixed one-line tail is enough to *detect* (E)/(S); it is not enough to *reconstruct*
+  what needs redoing.
 - **One reminder, not nagging.** The hook already stops once you've had a clean
   substantive session; mirror that restraint in conversation.
