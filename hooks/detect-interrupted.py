@@ -52,13 +52,15 @@ substantive session exists (i.e. you've moved on). --list still shows probes, fo
 transparency, since a "probe" is occasionally a real request typed on a dead connection.
 
 Orphaned queued notes (secondary surfacing): the clean-session suppression above stops the
-full resume offer, but it must NOT silently bury real notes a user queued into an EARLIER
-interrupted session during a down phase ("I fixed that bug and pushed it") just because a
-later, possibly trivial, clean session happened. So when the full offer is suppressed, we
-still walk back — bounded to a recent window (ORPHANED_NOTE_WINDOW_S) and stopping at the
-next clean substantive session — and, if any interrupted session in that span holds queued
-notes, emit a distinct, lightweight one-shot notice (NOT the resume banner). This surfaces
-the content without reopening the moved-on task or nagging.
+full resume offer, but it must NOT silently bury real notes a user typed into dead-end probe
+sessions AFTER the newest substantive session ("I fixed that bug and pushed it", typed while
+checking "are we back yet?" during a down phase). New sessions are created per retry, so
+those probes are chronologically NEWER than the clean top-of-stack — the clean session being
+older does not mean the user has moved past notes typed after it. So when the full offer is
+suppressed, we still scan the NEWER, has_work=False probes ahead of the clean top (bounded to
+a recent window, ORPHANED_NOTE_WINDOW_S, and stopping at the first has_work=True session in
+that range) and, if any hold queued notes, emit a distinct, lightweight one-shot notice (NOT
+the resume banner). This surfaces the content without reopening the moved-on task or nagging.
 
 Platform limitation (not fixable here): a sufficiently abrupt kill can terminate the client
 before ANYTHING is flushed to the session's own .jsonl — no error turn, no dangling prompt,
@@ -306,34 +308,56 @@ def _recommended(proj, current_sid):
     return (None, None)
 
 
-# How far back to look for orphaned queued notes when the full resume-offer is suppressed.
-# Rationale: queued notes are near-term, actionable follow-ups ("I fixed the bug and pushed
-# it", "important data point") — worth surfacing for a couple of weeks so a down-phase that
-# straddled a weekend or a short break isn't silently swallowed, but NOT resurrecting a note
-# from months ago the first time a clean session ever happens. 14 days is a deliberately
-# conservative window: long enough to cover a realistic stall-then-move-on gap, short enough
-# that stale threads go quiet on their own.
+# How far forward (in wall-clock terms, i.e. how recent relative to now) to look for
+# orphaned queued notes when the full resume-offer is suppressed. Rationale: queued notes
+# are near-term, actionable follow-ups ("I fixed the bug and pushed it", "important data
+# point") worth surfacing for a couple of weeks, but NOT resurrecting a note from months ago
+# the first time this check happens to run. 14 days is a deliberately conservative window:
+# long enough to cover a realistic gap between the dead-end probes and the next real session,
+# short enough that stale threads go quiet on their own.
 ORPHANED_NOTE_WINDOW_S = 14 * 24 * 60 * 60
 
 
 def _orphaned_queued_notes(proj, current_sid):
-    """Queued notes stranded by suppression: when _recommended() returns (None, None) because
-    the newest substantive session is CLEAN, an OLDER interrupted session further back can
-    still hold real user notes queued during a down-phase (e.g. "I manually fixed a bug and
-    pushed it") that never got a reply. The clean-suppression rule would make those forever
-    invisible the moment any later clean session happened — even a trivial, unrelated one.
+    """Queued notes stranded by suppression, from dead-end probes typed AFTER the last clean
+    substantive session.
 
-    This surfaces that content in a lightweight, distinct-from-the-full-banner way, WITHOUT
-    regressing the "stop nagging about the SAME unfinished task" restraint:
+    Real-world shape this fixes (confirmed against this project's own transcripts, not
+    hypothetical): a session dies on a kill abrupt enough to leave NOTHING on disk (the
+    separately-documented, unfixable platform limitation). The user retries into a brand new
+    session; if the API is still down, THAT one is a bare probe too (has_work=False) — often
+    several in a row, each just an unanswered "are we back yet?" or, sometimes, a real note
+    ("heads up: I manually fixed a bug you created, already pushed") typed while checking.
+    Eventually the API recovers and a genuine, clean, substantive session happens.
+
+    _recommended() correctly walks past those has_work=False probes to find the newest
+    SUBSTANTIVE session for the resume decision — but that substantive session is
+    chronologically OLDER than the probes (new session per retry means retries sort newer,
+    since they were created later in wall-clock time). So "the newest substantive session is
+    clean" does NOT mean the user has seen or moved past notes queued into probes typed AFTER
+    it — it means the opposite: those probes came LATER and are still unacknowledged.
+
+    So this walks the NEWER end of `_prior_files`' newest-first list — i.e. everything before
+    the clean top-of-stack substantive session index — collecting queued notes from
+    has_work=False probes. It stops if it hits ANY has_work=True session in that newer range:
+    that would mean real work actually happened after the probes, which is the caller's
+    responsibility (either _recommended's own check, if newest, or a sign the probes were
+    already superseded by acknowledged work) — not this function's to reach past.
 
       - Only runs when the top-of-stack substantive session is clean (suppression active).
         If the newest substantive session was itself interrupted, the full resume banner
         fires instead and this is not consulted.
-      - Walks back only until a SECOND clean substantive session — anything queued before an
-        even-earlier clean session was already moved-past in a prior era, so we stop there
-        rather than reopening ancient threads.
-      - Bounded by ORPHANED_NOTE_WINDOW_S measured from the clean top session's mtime, so a
-        note is only resurrected if it's recent relative to where you actually are now.
+      - Bounded by ORPHANED_NOTE_WINDOW_S measured back from NOW (not from the clean top's
+        mtime — these probes are typically newer than "now minus a bit", so anchoring on the
+        clean top would under-cover exactly the sessions we care about). A probe older than
+        the window is treated as stale and dropped.
+
+    An "older than a clean session, from an even earlier interrupted session" case was also
+    considered (walking backwards past top_idx) but is not exercised here: given sessions are
+    created strictly forward in time on each retry, an interrupted session that predates a
+    clean session was, by construction, already superseded by that later clean session — the
+    user chronologically moved past it. Only the newer-than-clean-top direction reflects how
+    sessions actually get created.
 
     Returns a list of (path, mtime_str, [notes...]) newest-first, or [] if nothing qualifies.
     """
@@ -349,22 +373,17 @@ def _orphaned_queued_notes(proj, current_sid):
     top = files[top_idx]
     if classify(top)["interrupted"]:
         return []  # newest substantive session is interrupted -> full banner handles it
-    try:
-        cutoff = os.path.getmtime(top) - ORPHANED_NOTE_WINDOW_S
-    except OSError:
-        return []
+    cutoff = time.time() - ORPHANED_NOTE_WINDOW_S
     out = []
-    for f in files[top_idx + 1:]:
+    for f in files[:top_idx]:  # newer than the clean top, newest-first
         info = classify(f)
-        if not info["has_work"]:
-            continue  # skip bare probes when deciding the "moved-on" boundary and for notes
-        if not info["interrupted"]:
-            break  # a second clean substantive session -> older notes were already moved past
+        if info["has_work"]:
+            break  # real work happened after the probes -> not this function's to reach past
         try:
             if os.path.getmtime(f) < cutoff:
-                break  # beyond the recency window; nothing older qualifies (list is sorted)
+                continue  # this probe is stale; a newer one in the same walk may still qualify
         except OSError:
-            break
+            continue
         notes = queued_prompts(_records(f))
         if notes:
             out.append((f, _mtime_str(f), notes))
@@ -420,17 +439,18 @@ def _emit_auto(path, info, others):
 
 
 def _emit_orphaned_queued_notes(groups):
-    """Lightweight surfacing (NOT the full resume banner) of queued notes stranded by
-    clean-session suppression. Distinct wording so it never reads as "resume this task" —
-    the task was moved on from; these are just orphaned notes worth capturing before they're
-    lost. `groups` is the list from _orphaned_queued_notes()."""
+    """Lightweight surfacing (NOT the full resume banner) of queued notes stranded in
+    dead-end probe sessions typed AFTER the last clean substantive session. Distinct wording
+    so it never reads as "resume a task" — there's no task to resume, just unacknowledged
+    notes typed while checking whether a down phase had cleared, worth capturing before
+    they're lost. `groups` is the list from _orphaned_queued_notes()."""
     total = sum(len(notes) for _, _, notes in groups)
     rule = "─" * 46
     lines = [rule,
-             "✎ QUEUED NOTES from an earlier interrupted session may be unaddressed",
-             "You've since had a clean session, so the resume offer is off — but %d note%s "
-             "queued during an earlier down phase never got a reply:"
-             % (total, "s" if total != 1 else "")]
+             "✎ QUEUED NOTES from dead-end retry sessions may be unaddressed",
+             "Your last substantive session was clean, but %d note%s typed into later "
+             "probe/retry session%s never got a reply:"
+             % (total, "s" if total != 1 else "", "s" if total != 1 else "")]
     for _, ts, notes in groups:
         for note in notes:
             lines.append("  · (%s) \"%s\"" % (ts, _quote(note, 90)))
@@ -438,13 +458,14 @@ def _emit_orphaned_queued_notes(groups):
     banner = "\n".join(lines)
     flat = "; ".join("\"%s\" (%s)" % (_norm(n)[:120], ts)
                      for _, ts, notes in groups for n in notes)
-    ctx = ("resume-interrupted: your most recent substantive session was clean, so the "
-           "full resume offer is intentionally suppressed (you've moved on from the "
-           "interrupted task). HOWEVER, an earlier interrupted session within the recent "
-           "window still holds %d user note%s queued during a down phase that never got a "
-           "reply and would otherwise be lost forever. Do NOT push to resume the old task — "
-           "just surface these once and offer to help capture each as a follow-up/to-do so "
-           "nothing actionable is dropped: %s" % (total, "s" if total != 1 else "", flat))
+    ctx = ("resume-interrupted: your most recent SUBSTANTIVE session was clean, so the full "
+           "resume offer is intentionally suppressed (there's no unfinished task to resume). "
+           "HOWEVER, one or more dead-end probe/retry sessions typed AFTER that clean session "
+           "(e.g. while checking whether a down phase had cleared) still hold %d user note%s "
+           "that never got a reply and would otherwise be lost forever. Do NOT offer to resume "
+           "anything — just surface these once and offer to help capture each as a "
+           "follow-up/to-do so nothing actionable is dropped: %s"
+           % (total, "s" if total != 1 else "", flat))
     print(json.dumps({"systemMessage": banner,
                       "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
