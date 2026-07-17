@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Framework-free tests for the resume-interrupted detector (v0.2.4).
+"""Framework-free tests for the resume-interrupted detector (v0.2.12).
 
 Covers classify() on the real transcript shapes, plus the two script modes: the auto
 SessionStart banner and the --list browse. No third-party deps.
@@ -304,6 +304,60 @@ check(__import__("time").monotonic() - t0 < 0.1, "no-hidden-changes not enabled 
 
 detect._wait_for_no_hidden_changes("")
 check(True, "empty session id -> no-op, never raises")
+
+print("\n== v0.2.12: orphaned queued notes surface past a later clean session (bounded) ==")
+# A queued note lives in an interrupted session; a LATER, unrelated clean session exists.
+# Old behavior: the clean top-of-stack suppressed everything and the note vanished.
+# New behavior: the note is surfaced via a distinct (non-resume) notice.
+DAY = 24 * 60 * 60
+NOTE_SESS = [U("build the thing"), A("starting"),
+             U("btw I manually fixed the bug you introduced and pushed it"), LP("btw I manually fixed the bug you introduced and pushed it")]
+# clean session is NEWER (higher mtime) than the interrupted note session, within window.
+d = proj_with([("noted.jsonl", NOTE_SESS, 10 * DAY), ("clean.jsonl", CLEAN, 11 * DAY)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+check(bool(out.strip()), "orphaned-note case is no longer fully silent")
+o = json.loads(out) if out.strip() else {}
+banner = o.get("systemMessage", "")
+ctx = o.get("hookSpecificOutput", {}).get("additionalContext", "")
+check("manually fixed the bug" in banner, "banner surfaces the orphaned queued note content")
+check("manually fixed the bug" in ctx, "additionalContext carries the orphaned queued note")
+check("QUEUED NOTES" in banner and "INTERRUPTED SESSION" not in banner,
+      "uses the distinct queued-notes notice, NOT the full resume banner")
+
+print("== v0.2.12: suppression preserved when nothing interesting is queued further back ==")
+# Interrupted session further back but with NO queued notes (limit-kill mid-work, no notes
+# after) + a later clean session -> still fully silent (no regression, no nagging).
+NONOTE = [U("do work"), A("starting"), A(BUDGET), LP("do work")]  # dangling echoes answered prompt, no queued note
+d = proj_with([("nonote.jsonl", NONOTE, 10 * DAY), ("clean.jsonl", CLEAN, 11 * DAY)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+check(out.strip() == "", "no queued notes further back -> stays silent (suppression preserved)")
+# Also: purely clean history stays silent.
+d = proj_with([("c1.jsonl", CLEAN, 10 * DAY), ("c2.jsonl", CLEAN, 11 * DAY)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+check(out.strip() == "", "all-clean history -> stays silent")
+
+print("== v0.2.12: bounded recency window — an ancient queued note is NOT resurrected ==")
+# Same note, but the interrupted session is >14 days older than the clean top session.
+d = proj_with([("old.jsonl", NOTE_SESS, 1 * DAY), ("clean.jsonl", CLEAN, 40 * DAY)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+check(out.strip() == "", "note older than the recency window is not resurrected")
+
+print("== v0.2.12: walk-back stops at an intervening (older) clean session ==")
+# note session (oldest) -> clean session -> clean top. The note predates a clean session,
+# so it was already moved-past in a prior era; must NOT be resurrected by today's clean top.
+d = proj_with([("noted.jsonl", NOTE_SESS, 8 * DAY),
+               ("midclean.jsonl", CLEAN, 9 * DAY),
+               ("topclean.jsonl", CLEAN, 10 * DAY)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+check(out.strip() == "", "note behind an intervening clean session is not resurfaced")
+
+print("== v0.2.12: full resume banner still wins when newest substantive session is interrupted ==")
+# If the newest substantive session is itself interrupted, the FULL banner fires (unchanged)
+# and the orphaned-notes path is not consulted.
+d = proj_with([("older-note.jsonl", NOTE_SESS, 9 * DAY), ("work.jsonl", WORK, 10 * DAY)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+banner = json.loads(out).get("systemMessage", "") if out.strip() else ""
+check("INTERRUPTED SESSION" in banner, "newest interrupted session -> full resume banner (orphaned path not used)")
 
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

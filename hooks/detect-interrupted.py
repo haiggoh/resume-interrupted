@@ -50,6 +50,21 @@ real assistant turn). Bare "are we back yet?" probes are skipped for the recomme
 so the offer re-appears after a killed/empty session but goes quiet once a clean
 substantive session exists (i.e. you've moved on). --list still shows probes, for
 transparency, since a "probe" is occasionally a real request typed on a dead connection.
+
+Orphaned queued notes (secondary surfacing): the clean-session suppression above stops the
+full resume offer, but it must NOT silently bury real notes a user queued into an EARLIER
+interrupted session during a down phase ("I fixed that bug and pushed it") just because a
+later, possibly trivial, clean session happened. So when the full offer is suppressed, we
+still walk back — bounded to a recent window (ORPHANED_NOTE_WINDOW_S) and stopping at the
+next clean substantive session — and, if any interrupted session in that span holds queued
+notes, emit a distinct, lightweight one-shot notice (NOT the resume banner). This surfaces
+the content without reopening the moved-on task or nagging.
+
+Platform limitation (not fixable here): a sufficiently abrupt kill can terminate the client
+before ANYTHING is flushed to the session's own .jsonl — no error turn, no dangling prompt,
+no queued note, nothing on disk. Such a session leaves zero transcript trace, so it is
+unrecoverable by design; there is nothing for this script's logic to detect or resume. This
+is a Claude Code platform behaviour, not a bug in this detector.
 """
 
 import sys, os, json, glob, time
@@ -291,6 +306,71 @@ def _recommended(proj, current_sid):
     return (None, None)
 
 
+# How far back to look for orphaned queued notes when the full resume-offer is suppressed.
+# Rationale: queued notes are near-term, actionable follow-ups ("I fixed the bug and pushed
+# it", "important data point") — worth surfacing for a couple of weeks so a down-phase that
+# straddled a weekend or a short break isn't silently swallowed, but NOT resurrecting a note
+# from months ago the first time a clean session ever happens. 14 days is a deliberately
+# conservative window: long enough to cover a realistic stall-then-move-on gap, short enough
+# that stale threads go quiet on their own.
+ORPHANED_NOTE_WINDOW_S = 14 * 24 * 60 * 60
+
+
+def _orphaned_queued_notes(proj, current_sid):
+    """Queued notes stranded by suppression: when _recommended() returns (None, None) because
+    the newest substantive session is CLEAN, an OLDER interrupted session further back can
+    still hold real user notes queued during a down-phase (e.g. "I manually fixed a bug and
+    pushed it") that never got a reply. The clean-suppression rule would make those forever
+    invisible the moment any later clean session happened — even a trivial, unrelated one.
+
+    This surfaces that content in a lightweight, distinct-from-the-full-banner way, WITHOUT
+    regressing the "stop nagging about the SAME unfinished task" restraint:
+
+      - Only runs when the top-of-stack substantive session is clean (suppression active).
+        If the newest substantive session was itself interrupted, the full resume banner
+        fires instead and this is not consulted.
+      - Walks back only until a SECOND clean substantive session — anything queued before an
+        even-earlier clean session was already moved-past in a prior era, so we stop there
+        rather than reopening ancient threads.
+      - Bounded by ORPHANED_NOTE_WINDOW_S measured from the clean top session's mtime, so a
+        note is only resurrected if it's recent relative to where you actually are now.
+
+    Returns a list of (path, mtime_str, [notes...]) newest-first, or [] if nothing qualifies.
+    """
+    files = _prior_files(proj, current_sid)
+    # Find the newest substantive session and confirm it's the clean one that suppressed.
+    top_idx = None
+    for i, f in enumerate(files):
+        if classify(f)["has_work"]:
+            top_idx = i
+            break
+    if top_idx is None:
+        return []
+    top = files[top_idx]
+    if classify(top)["interrupted"]:
+        return []  # newest substantive session is interrupted -> full banner handles it
+    try:
+        cutoff = os.path.getmtime(top) - ORPHANED_NOTE_WINDOW_S
+    except OSError:
+        return []
+    out = []
+    for f in files[top_idx + 1:]:
+        info = classify(f)
+        if not info["has_work"]:
+            continue  # skip bare probes when deciding the "moved-on" boundary and for notes
+        if not info["interrupted"]:
+            break  # a second clean substantive session -> older notes were already moved past
+        try:
+            if os.path.getmtime(f) < cutoff:
+                break  # beyond the recency window; nothing older qualifies (list is sorted)
+        except OSError:
+            break
+        notes = queued_prompts(_records(f))
+        if notes:
+            out.append((f, _mtime_str(f), notes))
+    return out
+
+
 def _emit_auto(path, info, others):
     ts = _mtime_str(path)
     d = _quote(info["dangling"])
@@ -335,6 +415,36 @@ def _emit_auto(path, info, others):
                 "follow-up so it isn't lost: %s"
                 % (len(queued), "s" if len(queued) != 1 else "",
                    "; ".join("\"%s\"" % _norm(q)[:120] for q in queued)))
+    print(json.dumps({"systemMessage": banner,
+                      "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+
+
+def _emit_orphaned_queued_notes(groups):
+    """Lightweight surfacing (NOT the full resume banner) of queued notes stranded by
+    clean-session suppression. Distinct wording so it never reads as "resume this task" —
+    the task was moved on from; these are just orphaned notes worth capturing before they're
+    lost. `groups` is the list from _orphaned_queued_notes()."""
+    total = sum(len(notes) for _, _, notes in groups)
+    rule = "─" * 46
+    lines = [rule,
+             "✎ QUEUED NOTES from an earlier interrupted session may be unaddressed",
+             "You've since had a clean session, so the resume offer is off — but %d note%s "
+             "queued during an earlier down phase never got a reply:"
+             % (total, "s" if total != 1 else "")]
+    for _, ts, notes in groups:
+        for note in notes:
+            lines.append("  · (%s) \"%s\"" % (ts, _quote(note, 90)))
+    lines += ["Ask me to help capture any of these as a follow-up, or say \"list interrupted\".", rule]
+    banner = "\n".join(lines)
+    flat = "; ".join("\"%s\" (%s)" % (_norm(n)[:120], ts)
+                     for _, ts, notes in groups for n in notes)
+    ctx = ("resume-interrupted: your most recent substantive session was clean, so the "
+           "full resume offer is intentionally suppressed (you've moved on from the "
+           "interrupted task). HOWEVER, an earlier interrupted session within the recent "
+           "window still holds %d user note%s queued during a down phase that never got a "
+           "reply and would otherwise be lost forever. Do NOT push to resume the old task — "
+           "just surface these once and offer to help capture each as a follow-up/to-do so "
+           "nothing actionable is dropped: %s" % (total, "s" if total != 1 else "", flat))
     print(json.dumps({"systemMessage": banner,
                       "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
@@ -463,6 +573,14 @@ def _run_auto():
             return
         path, info = _recommended(proj, sid)
         if not path:
+            # Full resume offer is suppressed (newest substantive session is clean, or there
+            # is none). Before going fully silent, check whether an earlier interrupted
+            # session within the recency window stranded real queued notes — surface those in
+            # a distinct, non-nagging way so actionable notes aren't lost to suppression.
+            groups = _orphaned_queued_notes(proj, sid)
+            if groups:
+                _emit_orphaned_queued_notes(groups)
+                printed = True
             return
         others = sum(1 for f in _prior_files(proj, sid)
                      if f != path and classify(f)["interrupted"])
