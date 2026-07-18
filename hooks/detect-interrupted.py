@@ -415,8 +415,10 @@ def _emit_auto(path, info, others):
     rule = "━" * 46
     lines = [rule, "⚡️ INTERRUPTED SESSION — likely unfinished work", line, req]
     if queued:
-        lines.append("＋ %d queued note%s from that session — ask me to surface them."
+        lines.append("＋ %d queued note%s from that session:"
                      % (len(queued), "s" if len(queued) != 1 else ""))
+        for note in queued:
+            lines.append("  · \"%s\"" % _quote(note, 90))
     lines += ["Say \"continue\" to resume, or \"list interrupted\" to browse.", rule]
     banner = "\n".join(lines)
     ctx = ("resume-interrupted: your most recent substantive session (%s) appears to have been "
@@ -433,7 +435,7 @@ def _emit_auto(path, info, others):
                 "got a reply — surface these and offer to help the user capture each as a "
                 "follow-up so it isn't lost: %s"
                 % (len(queued), "s" if len(queued) != 1 else "",
-                   "; ".join("\"%s\"" % _norm(q)[:120] for q in queued)))
+                   "; ".join("\"%s\"" % _quote(q, 120) for q in queued)))
     print(json.dumps({"systemMessage": banner,
                       "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
