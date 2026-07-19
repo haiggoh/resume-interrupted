@@ -88,13 +88,27 @@ interrupted-stream transcript ever surfaces, the principled signal is a missing/
 The SessionStart hook only *auto-offers* the single most likely session, and only until
 you've had a clean working session (it won't nag). When the user wants to see everything
 they might not have picked back up — "what did I leave unfinished?", "list interrupted
-sessions", "show me past sessions to resume" — run the detector in list mode:
+sessions", "show me past sessions to resume" — run the detector in list mode.
 
-```
-python3 "$CLAUDE_PLUGIN_ROOT/hooks/detect-interrupted.py" --list
-```
+> **Path caveat — do not paste `$CLAUDE_PLUGIN_ROOT` into the Bash tool.** That variable
+> is set only while a *hook* runs; it is **empty in the Bash-tool shell**, so
+> `"$CLAUDE_PLUGIN_ROOT/hooks/detect-interrupted.py"` resolves to `/hooks/...` and fails
+> with "No such file". Build an absolute path instead. The `hooks/` dir sits **two levels
+> up** from this skill's base directory (the "Base directory for this skill" path shown
+> when the skill loaded), so use:
+>
+> ```
+> python3 "<SKILL_BASE_DIR>/../../hooks/detect-interrupted.py" --list
+> ```
+>
+> If you don't have the base dir handy, resolve the newest installed copy (version- and
+> marketplace-agnostic):
+>
+> ```
+> python3 "$(ls -dt ~/.claude/plugins/cache/*/resume-interrupted/*/hooks/detect-interrupted.py | head -1)" --list
+> ```
 
-(Or `--list --dir <project transcripts dir>` to target a specific project.) It prints
+(Add `--dir <project transcripts dir>` to target a specific project.) It prints
 every interrupted session, most recent first, and marks the most likely resume candidate
 with `>`. Present it as a short table and ask which one to jump back into.
 
