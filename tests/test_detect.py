@@ -113,6 +113,25 @@ check(c["interrupted"] and c["reason"] == "stalled", "genuine stall after a skil
 c = detect.classify(session([U("go"), AERR("Overloaded"), A("recovered — here's the answer"), LP("go")]))
 check((not c["interrupted"]) and c["has_work"], "recovered mid-session error is not a kill")
 
+print("== Pass A (v0.2.16): continuation-stub masking fix + additive fields ==")
+# The real bug: an early real human turn with NO genuine reply, masked by a later
+# "Continue from where you left off." stub whose filler reply makes it look answered.
+c = detect.classify(session([U("real early note"),
+                             U("Continue from where you left off."),
+                             A("No response requested.")]))
+check(c["interrupted"] and c["reason"] == "stalled", "masked early turn is surfaced, not swallowed")
+check(c["dangling"] == "real early note", "surfaces the EARLIEST unanswered real turn, not the stub")
+check(c["is_downtime_note"] is True, "flags it a downtime note (a stub follows the real turn)")
+check(c["has_work"] is False, "a stub's filler reply does not count as genuine work")
+# Clean answered session: not a downtime note, reports its genuine work-turn count.
+c = detect.classify(session([U("hi"), A("one"), U("more"), A("two"), LP("more")]))
+check(c["is_downtime_note"] is False and c["work_count"] == 2, "clean session: not downtime, work_count=2")
+# A real trailing dangling turn (NO stub after it) is a primary stall, not a downtime note.
+c = detect.classify(session([U("first"), A("done"), U("dangling"), LP("dangling")]))
+check(c["interrupted"] and c["reason"] == "stalled" and c["is_downtime_note"] is False,
+      "trailing real dangling turn is a primary stall, not a downtime note")
+check(c["work_count"] == 1, "work_count returned alongside has_work")
+
 
 def run(argv, stdin=""):
     r = subprocess.run([sys.executable, SCRIPT] + argv, input=stdin,
@@ -192,6 +211,7 @@ out = run(["--list", "--dir", d])
 check("RECOMMENDED" in out, "marks a recommendation")
 check("are we back yet?" in out, "probe prompt shown (transparency)")
 check("[probe]" in out and "[work" in out, "labels work vs probe")
+check("wt" in out, "--list shows a work-turn count (Pass A item 3)")
 
 print("== never blocks: garbage stdin exits cleanly, no output ==")
 out = run([], stdin="not json")

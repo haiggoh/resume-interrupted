@@ -243,45 +243,100 @@ def _is_stale_last_prompt(recs, last_prompt):
     return False
 
 
+# Auto-continuation stubs Claude Code injects when a dead/blocked session is resumed while its
+# previous turn never got a genuine reply. These are NOT real human input: a later stub's
+# filler reply ("No response requested.") makes an EARLIER real, never-answered turn look
+# "answered", masking it. classify() therefore skips stubs when finding the last genuine human
+# turn and when deciding "answered". Matched normalized, lower-cased, trailing-punctuation-stripped.
+_CONTINUATION_STUBS = {
+    "continue from where you left off",
+    "continue from where we left off",
+    "no response requested",
+}
+
+
+def _is_continuation_stub(t):
+    """True if t is a Claude Code auto-continuation stub rather than genuine human input."""
+    return _norm(t).lower().rstrip(".!? ") in _CONTINUATION_STUBS
+
+
 def classify(path):
-    """Return dict: interrupted, has_work, dangling, reason ('limit-kill'|'stalled'|'')."""
+    """Return dict: interrupted, has_work, dangling, reason ('limit-kill'|'stalled'|''),
+    work_count (int: genuine assistant work turns), is_downtime_note (bool: the surfaced
+    unanswered turn is a queued downtime note masked by a later continuation stub, i.e. not
+    the primary session to resume — the primary-vs-downtime CHOICE stays in the orchestration
+    layer, this is just the raw signal)."""
     recs = _records(path)
     if not recs:
-        return {"interrupted": False, "has_work": False, "dangling": "", "reason": ""}
+        return {"interrupted": False, "has_work": False, "dangling": "", "reason": "",
+                "work_count": 0, "is_downtime_note": False}
     last_prompt = ""
-    last_human_idx = -1
+    last_human_idx = -1              # last GENUINE (non-stub) human turn
     last_assistant_is_error = False
     work = 0
+    human_ctx_is_stub = False        # is the current human context an auto-continuation stub?
     for i, o in enumerate(recs):
         if o.get("type") == "last-prompt":
             last_prompt = o.get("lastPrompt") or ""
         m = o.get("message", {})
         role = m.get("role")
         if role == "user" and _human_text(m) is not None:
-            last_human_idx = i
+            if _is_continuation_stub(_human_text(m)):
+                human_ctx_is_stub = True          # skip: not a genuine last human turn
+            else:
+                human_ctx_is_stub = False
+                last_human_idx = i
         elif role == "assistant":
             at = _assistant_text(m)
             last_assistant_is_error = _is_error_turn(o, at)
-            if at and not last_assistant_is_error:
+            # A filler reply to a stub (assistant under stub context) is not real work.
+            if at and not last_assistant_is_error and not human_ctx_is_stub:
                 work += 1
     has_work = work >= 1
     last_human = _human_text(recs[last_human_idx]["message"]) if last_human_idx >= 0 else ""
 
-    if last_assistant_is_error:
-        return {"interrupted": True, "has_work": has_work,
-                "dangling": last_prompt or last_human, "reason": "limit-kill"}
+    # Downtime-note signal: a continuation stub appears AFTER the last genuine human turn,
+    # meaning that turn was queued while a prior session was dead and later auto-continued.
+    is_downtime_note = False
     if last_human_idx >= 0:
-        answered = any(recs[j].get("message", {}).get("role") == "assistant"
-                       for j in range(last_human_idx + 1, len(recs)))
+        for o in recs[last_human_idx + 1:]:
+            mm = o.get("message", {})
+            if (mm.get("role") == "user" and _human_text(mm) is not None
+                    and _is_continuation_stub(_human_text(mm))):
+                is_downtime_note = True
+                break
+
+    def _res(interrupted, dangling, reason):
+        return {"interrupted": interrupted, "has_work": has_work, "dangling": dangling,
+                "reason": reason, "work_count": work, "is_downtime_note": is_downtime_note}
+
+    if last_assistant_is_error:
+        return _res(True, last_prompt or last_human, "limit-kill")
+    if last_human_idx >= 0:
+        # "answered" = a GENUINE assistant reply after the last real human turn. A filler reply
+        # under a continuation-stub context does NOT count (else the stub masks the real turn's
+        # lack of a reply). Gap-timing heuristic (item 4, NO logic yet): a future pass could
+        # compare the gap between last real content and a trailing marker's timestamp to the
+        # ~3-min retry-exhaustion window — no observed case warrants it (12 examples all <75s).
+        answered = False
+        ctx_stub = False
+        for j in range(last_human_idx + 1, len(recs)):
+            mj = recs[j].get("message", {})
+            rj = mj.get("role")
+            if rj == "user" and _human_text(mj) is not None:
+                ctx_stub = _is_continuation_stub(_human_text(mj))
+            elif rj == "assistant" and not ctx_stub:
+                answered = True
+                break
         if not answered:
-            return {"interrupted": True, "has_work": has_work, "dangling": last_human, "reason": "stalled"}
+            return _res(True, last_human, "stalled")
         if (last_prompt and _norm(last_prompt)[:60] != _norm(last_human)[:60]
                 and not _is_stale_last_prompt(recs, last_prompt)):
-            return {"interrupted": True, "has_work": has_work, "dangling": last_prompt, "reason": "stalled"}
+            return _res(True, last_prompt, "stalled")
     elif last_prompt and not _is_stale_last_prompt(recs, last_prompt):
-        return {"interrupted": True, "has_work": has_work, "dangling": last_prompt, "reason": "stalled"}
+        return _res(True, last_prompt, "stalled")
 
-    return {"interrupted": False, "has_work": has_work, "dangling": "", "reason": ""}
+    return _res(False, "", "")
 
 
 def _mtime_str(path):
@@ -506,8 +561,11 @@ def _run_list(argv):
     for f, info in rows:
         mark = "> RECOMMENDED" if f == rec_path else "             "
         kind = "work " if info["has_work"] else "probe"
+        note = " downtime-note" if info.get("is_downtime_note") else ""
         d = _norm(info["dangling"])[:80]
-        print("  %s  %s  [%s]  %-10s  \"%s\"" % (mark, _mtime_str(f), kind, info["reason"], d))
+        # work-turn count (item 3, inspired by native /resume's message count) + downtime-note flag
+        print("  %s  %s  [%s]  %2dwt  %-10s%s  \"%s\"" % (
+            mark, _mtime_str(f), kind, info.get("work_count", 0), info["reason"], note, d))
         # Surface every note queued into that session during its down phase, so multi-note
         # queues aren't lost to the single trailing quote above (each is a candidate follow-up).
         queued = queued_prompts(_records(f))
