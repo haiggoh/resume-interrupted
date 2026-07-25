@@ -118,6 +118,28 @@ labelled `[probe]` (usually a failed "are we back yet?" availability check). The
 request assuming the connection was already restored, so a probe can matter. Recommend
 the `[work]` candidate, but surface the probes so the user can spot a lost real request.
 
+## Also check sessions the standard detector can't see
+
+The SessionStart detector and the procedure above only see `~/.claude/projects/<encoded-cwd>/`.
+Some setups run Claude Code through a **proxy, relay, or alternate client** that does **not**
+persist a native transcript there — e.g. a local-model session routed via a relay. Those
+sessions are invisible to the detector, so unfinished work *and any decisions made in them*
+won't be auto-offered on resume, even though they may be the most recent context.
+
+**On resume, if this environment is known to run such sessions, also review their secondary
+transcript store** (wherever the proxy/relay mirrors sessions) before concluding you're
+caught up. Skim the most recent one(s) for two things:
+
+- **developments or decisions** the current session should know about (a rule the user
+  established there, a design choice, a half-finished change), and
+- **anything left in a bad state** worth correcting — a model running in that environment may
+  have made mistakes a review session should fix: invented/wrong paths, malformed tool
+  arguments (e.g. an id passed as a number when the schema wants a string), or assumptions
+  stated as settled fact.
+
+Where those transcripts live, and the specific mistakes to look for, are environment-specific
+— record them in your project/user notes so this step is concrete rather than abstract.
+
 ## Guardrails
 
 - **Verify, don't assume.** Confirm the interruption from the transcript before asserting
