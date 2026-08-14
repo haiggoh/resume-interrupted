@@ -44,6 +44,36 @@ tool call with no trailing text, so prose-shape matching false-positives. If a r
 interrupted-stream transcript ever surfaces, the principled signal is a missing/`null`
 `stop_reason` (deterministic), not prose shape.
 
+## A limit kill carries a constraint — check whether it has expired
+
+**(E) and (S) differ in one way that outlives the interruption.** A crash or a dropped
+connection tells you nothing about the world now. A **usage/credit/quota kill** does: it
+says "you were out of allowance." That statement was true at the moment of death and
+becomes false again at the provider's next reset — so when you resume a session that died
+this way, establish whether the constraint is still current **before** you act on it.
+
+- **Different reset period than the kill → the old limit is not in force.** Do not warn the
+  user about it, do not treat it as a current constraint, and do not quietly scale the plan
+  down because of it. Yesterday's exhausted allowance is not evidence about today's.
+- **Same reset period → it may still apply.** Say "may", and confirm against a live signal.
+- **Applies to (E) only.** A crash or dropped connection gets no such inference — there was
+  no constraint to expire.
+- **Never invent the allowance.** The finding is *"a reset boundary has passed"*, which
+  needs no cap value, and no assumption that a cap exists at all. If something in the
+  environment tracks cost or limits, read the current figure from it; if nothing does, say
+  the state is unknown rather than guessing a number.
+
+The companion hook does this arithmetic for a limit kill it detects and states the verdict
+in its notice. Doing it by hand: compare the **reset period** containing the kill against
+the one containing now — not the calendar date. The boundary is the reset time **plus the
+provider's propagation lag** (default 00:00 UTC + 10 min, configurable via
+`RESUME_INTERRUPTED_RESET_UTC_HOUR` / `RESUME_INTERRUPTED_RESET_PROPAGATION_MIN`), so a kill
+at 23:50 and a resume at 00:05 are the *same* period and nothing has reset yet.
+
+**Which timestamp you used matters here.** Prefer the transcript's own last `timestamp`
+(the real event time) over the file's mtime, and say which one you read — the day boundary
+is exactly where the two can disagree and turn a correct verdict into a wrong one.
+
 ## Recovery procedure
 
 1. **Locate the transcripts.** Sessions for the current project live in one directory,
@@ -150,3 +180,7 @@ Where those transcripts live, and the specific mistakes to look for, are environ
   what needs redoing.
 - **One reminder, not nagging.** The hook already stops once you've had a clean
   substantive session; mirror that restraint in conversation.
+- **Don't inherit an expired limit.** After a usage/quota kill, resuming in a later reset
+  period means that limit is history. Reporting it as current is the same class of error as
+  claiming there's nothing to resume without looking — a confident statement about a state
+  you didn't check.

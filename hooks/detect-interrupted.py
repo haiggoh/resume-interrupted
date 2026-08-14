@@ -69,9 +69,25 @@ unrecoverable by design; there is nothing for this script's logic to detect or r
 is a Claude Code platform behaviour, not a bug in this detector.
 """
 
-import sys, os, json, glob, time
+import sys, os, json, glob, time, datetime
 
 ERROR_SIGNATURES = ("Budget has been exceeded", "API Error: Request rejected", "usage limit reached")
+
+# --- Limit-kill constraint staleness -------------------------------------------------
+# A limit kill is the only interruption that carries a CONSTRAINT forward: "you are out of
+# quota" is true at the moment of death and false again once the provider resets. A crash or
+# a dropped connection carries no such state, so this inference is scoped to
+# reason == "limit-kill" and is never applied to anything else.
+#
+# Nothing here learns, stores, or guesses a cap VALUE, and nothing assumes a cap exists: a
+# user who is never limited never gets a limit kill, so this code never runs for them. The
+# entire finding is "a reset boundary has passed since the kill" — which needs no cap.
+#
+# The boundary is HOUR:MINUTE UTC, where the minute is the provider's propagation lag rather
+# than an error bar around midnight: a resume 3 minutes after 00:00 UTC is deliberately NOT
+# treated as reset yet. Both are configurable for providers on other schedules.
+RESET_UTC_HOUR = int(os.environ.get("RESUME_INTERRUPTED_RESET_UTC_HOUR") or 0)
+RESET_PROPAGATION_MIN = int(os.environ.get("RESUME_INTERRUPTED_RESET_PROPAGATION_MIN") or 10)
 
 
 def _records(path):
@@ -340,8 +356,78 @@ def classify(path):
 
 
 def _mtime_str(path):
-    import datetime
     return datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
+
+
+def _parse_iso_utc(s):
+    """'2026-08-13T15:22:26.936Z' -> aware UTC datetime; None if unparseable or naive.
+
+    A naive timestamp is REFUSED rather than assumed to be UTC — guessing the zone would
+    silently shift the day boundary this whole feature turns on.
+    """
+    if not isinstance(s, str) or not s.strip():
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(datetime.timezone.utc)
+
+
+def _kill_time_utc(path, recs=None):
+    """When the session died, as (aware-UTC datetime, source).
+
+    source is "event" when it comes from the transcript's OWN last timestamp (the real event
+    time) and "mtime" when we fell back to the file's modification time. The two are reported
+    distinctly and never blurred: mtime is when the file was last WRITTEN, which is usually
+    but not always when the session died.
+    """
+    if recs is None:
+        recs = _records(path)
+    for o in reversed(recs):
+        dt = _parse_iso_utc(o.get("timestamp"))
+        if dt:
+            return dt, "event"
+    try:
+        return datetime.datetime.fromtimestamp(os.path.getmtime(path),
+                                               datetime.timezone.utc), "mtime"
+    except OSError:
+        return None, ""
+
+
+def _reset_period_start(dt):
+    """The most recent reset boundary at or before `dt` (both aware UTC)."""
+    boundary = dt.replace(hour=RESET_UTC_HOUR, minute=RESET_PROPAGATION_MIN,
+                          second=0, microsecond=0)
+    if dt < boundary:
+        boundary -= datetime.timedelta(days=1)
+    return boundary
+
+
+def limit_constraint_stale(path, recs=None, now=None):
+    """Has a limit reset happened since this session was killed?
+
+    Returns None when the question can't be answered (no readable kill time). Otherwise:
+      stale     — True iff a reset boundary fell between the kill and now
+      kill_utc  — aware UTC datetime of the kill
+      source    — "event" (transcript timestamp) or "mtime" (file fallback)
+      boundary  — the reset boundary that has since passed, else None
+
+    CALLER CONTRACT: only meaningful for reason == "limit-kill". Comparing reset PERIODS (not
+    calendar dates) is what makes the propagation minute count — a kill at 23:50 and a resume
+    at 00:05 are the same period, so nothing is declared stale.
+    """
+    kill, source = _kill_time_utc(path, recs)
+    if kill is None:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    killed_in = _reset_period_start(kill)
+    now_in = _reset_period_start(now)
+    stale = now_in > killed_in
+    return {"stale": stale, "kill_utc": kill, "source": source,
+            "boundary": now_in if stale else None}
 
 
 def _prior_files(proj, current_sid):
@@ -454,6 +540,9 @@ def _emit_auto(path, info, others):
              % (others, "s" if others != 1 else ""))
     # Reason-aware wording: a limit-kill answered the prompt and then died mid-work, so
     # "the request was never completed" (only true for a stall) would misreport it.
+    # A limit kill carries a constraint forward; a stall does not. So the reset check runs
+    # here and nowhere else (see limit_constraint_stale's caller contract).
+    fresh = limit_constraint_stale(path) if info["reason"] == "limit-kill" else None
     if info["reason"] == "limit-kill":
         line = "Last session (%s) was cut off by a usage/API limit mid-task." % ts
         req = "Last request: \"%s\"" % d
@@ -469,6 +558,8 @@ def _emit_auto(path, info, others):
     # which defaults to emoji presentation on its own.
     rule = "━" * 46
     lines = [rule, "⚡️ INTERRUPTED SESSION — likely unfinished work", line, req]
+    if fresh and fresh["stale"]:
+        lines.append("↻ A limit reset has passed since then — that limit is no longer current.")
     if queued:
         lines.append("＋ %d queued note%s from that session:"
                      % (len(queued), "s" if len(queued) != 1 else ""))
@@ -482,6 +573,25 @@ def _emit_auto(path, info, others):
            "Proactively offer to pick up where it left off — read the tail of that session's "
            "transcript to recover context, then continue. If the user has clearly moved on, "
            "mention it once and don't push.%s" % (ts, d, extra))
+    if fresh:
+        # The reason this matters: whatever limit stopped that session was a fact about a
+        # PAST period. Carrying it into this one produces confident, wrong caution — the
+        # agent throttles work, or tells the user they're blocked, on evidence that expired.
+        when = fresh["kill_utc"].strftime("%Y-%m-%d %H:%M UTC")
+        how = ("the transcript's own timestamp" if fresh["source"] == "event"
+               else "the transcript file's last-modified time, not a recorded event time")
+        if fresh["stale"]:
+            ctx += (" IMPORTANT — that interruption was a usage/limit error, and at least one "
+                    "limit reset boundary (%s) has passed since it happened (kill time %s, from "
+                    "%s). The limit that stopped that session is therefore NOT in force now: do "
+                    "not warn the user about it, do not treat it as a current constraint, and do "
+                    "not scale down the plan because of it. If you need the present state, get it "
+                    "from a live signal rather than from that session's error."
+                    % (fresh["boundary"].strftime("%Y-%m-%d %H:%M UTC"), when, how))
+        else:
+            ctx += (" Note: that interruption was a usage/limit error and NO reset boundary has "
+                    "passed since (kill time %s, from %s), so the limit may still be in force — "
+                    "confirm against a live signal before assuming either way." % (when, how))
     if queued:
         # Keep this universal: surface the lost notes and let the user decide how to keep
         # them (a follow-up, a to-do, whatever tool they use). Do NOT name a specific

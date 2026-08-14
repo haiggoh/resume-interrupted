@@ -45,6 +45,38 @@ skipped, and once you've completed a clean substantive session it goes quiet.
 > they simply never match and detection falls back to the universal `(S)` structural
 > signal. Edit `ERROR_SIGNATURES` in `hooks/detect-interrupted.py` to add your own.
 
+## A limit kill expires; a crash doesn't
+
+`(E)` and `(S)` differ in something that outlives the interruption. A crash tells you nothing
+about the world now. A **usage/quota kill** says "you were out of allowance" — true when the
+session died, and false again after the provider's next reset. So on resuming a limit kill,
+the notice also states whether that constraint is **still current**:
+
+```text
+⚡️ INTERRUPTED SESSION — likely unfinished work
+Last session (2026-08-13 23:52) was cut off by a usage/API limit mid-task.
+Last request: "build the thing"
+↻ A limit reset has passed since then — that limit is no longer current.
+```
+
+Claude is told, in the same breath, not to warn you about that limit or quietly scale work
+down because of it. Without this, yesterday's exhausted allowance gets carried into today as
+confident, wrong caution.
+
+- Scoped to `(E)` only — a crash or dropped connection gets no such inference.
+- **No allowance value is read, stored, or invented**, and none is assumed to exist: if you
+  are never limited you never get a limit kill, so this never fires for you.
+- Compares **reset periods, not calendar dates**, so a kill at 23:50 and a resume at 00:05
+  correctly count as the same period — nothing has reset yet.
+- Kill time comes from the transcript's own last timestamp where present, falling back to the
+  file's mtime, and the notice says **which** — the day boundary is exactly where those two
+  can disagree.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RESUME_INTERRUPTED_RESET_UTC_HOUR` | `0` | Hour (UTC) the provider's allowance resets |
+| `RESUME_INTERRUPTED_RESET_PROPAGATION_MIN` | `10` | Minutes of propagation lag after that hour, part of the boundary rather than an error bar around it |
+
 ## Relationship to waypoints
 
 A distinct companion to [`waypoints`](https://github.com/haiggoh/waypoints): separate plugin,

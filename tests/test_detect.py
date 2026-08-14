@@ -408,5 +408,112 @@ out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"),
 banner = json.loads(out).get("systemMessage", "") if out.strip() else ""
 check("INTERRUPTED SESSION" in banner, "newest interrupted session -> full resume banner (orphaned path not used)")
 
+print("\n== v0.3.0 (D11): a limit reset since the kill makes the old constraint stale ==")
+import datetime as _dt
+UTC = _dt.timezone.utc
+
+
+def _at(y, mo, d, h, mi):
+    return _dt.datetime(y, mo, d, h, mi, tzinfo=UTC)
+
+
+# --- _parse_iso_utc: the transcript's own format, and a refusal to guess a zone -----------
+check(detect._parse_iso_utc("2026-08-13T15:22:26.936Z") == _at(2026, 8, 13, 15, 22).replace(second=26, microsecond=936000),
+      "parses the real transcript timestamp format (trailing Z)")
+check(detect._parse_iso_utc("2026-08-13T15:22:26") is None,
+      "a NAIVE timestamp is refused, not assumed to be UTC (would shift the day boundary)")
+check(detect._parse_iso_utc("") is None and detect._parse_iso_utc(None) is None
+      and detect._parse_iso_utc("garbage") is None, "empty/None/garbage -> None")
+
+# --- _reset_period_start: the propagation minute is part of the boundary ------------------
+check(detect._reset_period_start(_at(2026, 8, 14, 0, 5)) == _at(2026, 8, 13, 0, 10),
+      "00:05 UTC still belongs to the PREVIOUS reset period (before the 00:10 boundary)")
+check(detect._reset_period_start(_at(2026, 8, 14, 0, 15)) == _at(2026, 8, 14, 0, 10),
+      "00:15 UTC belongs to the new reset period")
+
+# --- limit_constraint_stale: period comparison, not calendar-date comparison --------------
+KILLED = session([U("build it"), A("working"), A(BUDGET), LP("build it")])
+# NOTE: session() does not apply its mtime argument, so stamp the file explicitly — the
+# whole point of this path is that the kill time comes from the FILE when records carry none.
+os.utime(KILLED, (1000, 1000))            # epoch 1000 = 1970
+
+r = detect.limit_constraint_stale(KILLED, now=_at(2026, 8, 14, 9, 6))
+check(r is not None and r["stale"] is True, "a kill many days ago -> stale (mtime fallback path)")
+check(r["source"] == "mtime", "no record timestamps -> source is reported as 'mtime', not blurred")
+
+fresh_file = session([U("build it"), A("working"), A(BUDGET)])
+now_ = _dt.datetime.now(UTC)
+check(detect.limit_constraint_stale(fresh_file, now=now_)["stale"] is False,
+      "a file written just now -> not stale (mtime fallback agrees with the event path)")
+
+# The case a naive date comparison gets WRONG: different calendar days, same reset period.
+TS_KILL = [dict(U("build it"), timestamp="2026-08-13T23:50:00.000Z"),
+           dict(A("working"), timestamp="2026-08-13T23:51:00.000Z"),
+           dict(AERR(BUDGET), timestamp="2026-08-13T23:52:00.000Z")]
+p = session(TS_KILL)
+r = detect.limit_constraint_stale(p, now=_at(2026, 8, 14, 0, 5))
+check(r["source"] == "event", "record timestamps present -> source is 'event' (real event time)")
+check(r["stale"] is False,
+      "kill 23:50 + resume 00:05 next CALENDAR day = same reset period -> NOT stale")
+r = detect.limit_constraint_stale(p, now=_at(2026, 8, 14, 0, 15))
+check(r["stale"] is True and r["boundary"] == _at(2026, 8, 14, 0, 10),
+      "same kill + resume 00:15 -> stale, and names the boundary that passed")
+r = detect.limit_constraint_stale(p, now=_at(2026, 8, 13, 23, 59))
+check(r["stale"] is False, "resume 7 minutes after the kill -> nothing has reset")
+r = detect.limit_constraint_stale(p, now=_at(2026, 8, 17, 4, 0))
+check(r["stale"] is True, "resume 3 days later -> stale")
+check(detect.limit_constraint_stale("/nonexistent/nope.jsonl") is None,
+      "unreadable kill time -> None (question not answerable), never a guess")
+
+# --- end to end: the banner and the model-facing context ---------------------------------
+print("== v0.3.0 (D11): banner + additionalContext state the verdict ==")
+d = proj_with([("k.jsonl", WORK, 1000)])   # epoch 1000 = 1970 -> unambiguously stale
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+o = json.loads(out)
+banner, ctx = o.get("systemMessage", ""), o.get("hookSpecificOutput", {}).get("additionalContext", "")
+check("no longer current" in banner, "stale kill -> banner says the limit is no longer current")
+check("NOT in force" in ctx and "do not warn" in ctx,
+      "additionalContext tells the model not to carry or warn from the expired limit")
+check("UTC" in ctx, "context names the times in UTC explicitly")
+
+d = proj_with([("k.jsonl", WORK, time.time() - 60)])   # killed a minute ago -> same period
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+o = json.loads(out)
+banner, ctx = o.get("systemMessage", ""), o.get("hookSpecificOutput", {}).get("additionalContext", "")
+check("no longer current" not in banner, "fresh kill -> banner does NOT claim a reset happened")
+check("may still be in force" in ctx, "fresh kill -> context says the limit MAY still apply")
+
+# The scoping test: a stall carries no constraint, so it must get no such inference at all.
+d = proj_with([("s.jsonl", STALL, 1000)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+o = json.loads(out)
+banner, ctx = o.get("systemMessage", ""), o.get("hookSpecificOutput", {}).get("additionalContext", "")
+check("no longer current" not in banner and "reset" not in banner.lower(),
+      "(S) stalled -> NO reset line in the banner (a stall carries no constraint)")
+check("in force" not in ctx and "reset boundary" not in ctx,
+      "(S) stalled -> NO limit-constraint language in additionalContext")
+
+# No cap value is ever invented or implied.
+d = proj_with([("k.jsonl", WORK, 1000)])
+out = run([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"), "session_id": "NEW", "source": "startup"}))
+whole = out
+check("$" not in whole, "never prints a currency amount (no cap value is known or invented)")
+
+# Configurability of the boundary (a provider on a different schedule).
+os.environ["RESUME_INTERRUPTED_RESET_UTC_HOUR"] = "8"
+os.environ["RESUME_INTERRUPTED_RESET_PROPAGATION_MIN"] = "0"
+spec2 = importlib.util.spec_from_file_location("detect_cfg", SCRIPT)
+detect_cfg = importlib.util.module_from_spec(spec2)
+spec2.loader.exec_module(detect_cfg)
+check(detect_cfg.RESET_UTC_HOUR == 8 and detect_cfg.RESET_PROPAGATION_MIN == 0,
+      "reset boundary is configurable via env")
+check(detect_cfg._reset_period_start(_at(2026, 8, 14, 7, 59)) == _at(2026, 8, 13, 8, 0),
+      "with an 08:00 boundary, 07:59 belongs to the previous period")
+r = detect_cfg.limit_constraint_stale(p, now=_at(2026, 8, 14, 7, 0))
+check(r["stale"] is False,
+      "08:00-boundary provider: a 23:52 kill is NOT stale at 07:00 the next calendar day")
+del os.environ["RESUME_INTERRUPTED_RESET_UTC_HOUR"]
+del os.environ["RESUME_INTERRUPTED_RESET_PROPAGATION_MIN"]
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
