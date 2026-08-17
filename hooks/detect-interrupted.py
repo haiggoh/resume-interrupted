@@ -359,6 +359,30 @@ def _mtime_str(path):
     return datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
 
 
+def _session_time_str(path, recs=None):
+    """Display time for a session, from the EVENT time when one exists.
+
+    The banner previously took its header time from the file's mtime while the kill-time line
+    took the transcript's own last timestamp. Two sources for one session, and they disagree in
+    two independent ways: by SOURCE (mtime is when the file was last written, not when the
+    session died — restoring transcripts from a backup or a machine migration resets it, and the
+    header then shows a different DATE from the kill line) and by ZONE (the header rendered local
+    time against a kill line in UTC, so even a healthy session showed a UTC-offset gap).
+
+    Both are fixed here by rendering the same instant _kill_time_utc reports, in local time, with
+    the zone named — so the header and the kill line are reconcilable by inspection instead of
+    looking like a contradiction. When there is no usable event time we fall back to mtime and SAY
+    so, because an unlabelled fallback is what made the original disagreement unreadable.
+    """
+    dt, source = _kill_time_utc(path, recs)
+    if dt is None:
+        return _mtime_str(path)
+    local = dt.astimezone()
+    zone = local.strftime("%Z") or "local"
+    stamp = "%s %s" % (local.strftime("%Y-%m-%d %H:%M"), zone)
+    return stamp if source == "event" else "%s, file mtime" % stamp
+
+
 def _parse_iso_utc(s):
     """'2026-08-13T15:22:26.936Z' -> aware UTC datetime; None if unparseable or naive.
 
@@ -527,12 +551,12 @@ def _orphaned_queued_notes(proj, current_sid):
             continue
         notes = queued_prompts(_records(f))
         if notes:
-            out.append((f, _mtime_str(f), notes))
+            out.append((f, _session_time_str(f), notes))
     return out
 
 
 def _emit_auto(path, info, others):
-    ts = _mtime_str(path)
+    ts = _session_time_str(path)
     d = _quote(info["dangling"])
     queued = queued_prompts(_records(path))
     extra = ("" if others <= 0 else
@@ -675,7 +699,7 @@ def _run_list(argv):
         d = _norm(info["dangling"])[:80]
         # work-turn count (item 3, inspired by native /resume's message count) + downtime-note flag
         print("  %s  %s  [%s]  %2dwt  %-10s%s  \"%s\"" % (
-            mark, _mtime_str(f), kind, info.get("work_count", 0), info["reason"], note, d))
+            mark, _session_time_str(f), kind, info.get("work_count", 0), info["reason"], note, d))
         # Surface every note queued into that session during its down phase, so multi-note
         # queues aren't lost to the single trailing quote above (each is a candidate follow-up).
         queued = queued_prompts(_records(f))
