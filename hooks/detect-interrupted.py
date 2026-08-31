@@ -8,9 +8,18 @@ Two modes:
       emits a user-visible banner (systemMessage) + a model-facing notice
       (hookSpecificOutput.additionalContext) so Claude can offer to resume.
 
-  --list [--dir DIR]            Prints ALL interrupted sessions in the project (most
-      recent first), probes included, with the most likely resume candidate marked.
-      For the on-demand "show me everything I haven't picked back up" flow.
+  (CLI, any arguments)          The public `interrupted` command (bin/interrupted).
+      `list` / `--list` prints ALL interrupted sessions in the project (most recent
+      first), probes included, with the most likely resume candidate marked, for the
+      on-demand "show me everything I haven't picked back up" flow. `recommended`
+      prints just the one pick. --project does Claude Code's transcript-directory
+      encoding for you; --dir takes an already-encoded directory. --limit/--page/
+      --max-chars page the output by item count AND character budget; --json is the
+      complete, never-paginated contract. Read-only throughout.
+
+      The split between the two modes is exactly "does argv carry anything": the hook
+      is invoked with NO arguments, so an empty argv always stays hook mode. That is
+      what keeps the hook contract intact while the CLI grows.
 
 Why: a session that dies on a usage/credit limit, a crash, or a dropped connection can't
 record afterward that its work was unfinished. The only trace is the transcript.
@@ -661,53 +670,300 @@ def _emit_orphaned_queued_notes(groups):
                       "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
 
+def _encode_project_path(path):
+    """Claude Code's transcript-directory encoding for a real filesystem path:
+    /Users/me/Work.dir -> -Users-me-Work-dir. Exposed as its own function so the
+    CLI can do this FOR the user (--project) instead of making them hand-build a
+    path like ~/.claude/projects/-Users-me-Work-dir."""
+    return os.path.abspath(os.path.expanduser(path)).replace("/", "-").replace(".", "-")
+
+
+def _projects_root():
+    return os.path.expanduser("~/.claude/projects")
+
+
 def _project_dir_from_cwd():
-    enc = os.getcwd().replace("/", "-").replace(".", "-")
-    return os.path.join(os.path.expanduser("~/.claude/projects"), enc)
+    return os.path.join(_projects_root(), _encode_project_path(os.getcwd()))
 
 
-def _run_list(argv):
-    proj = None
-    if "--dir" in argv:
-        try:
-            proj = argv[argv.index("--dir") + 1]
-        except Exception:
-            proj = None
-    if not proj:
-        proj = _project_dir_from_cwd()
-    if not os.path.isdir(proj):
-        print("No project transcript directory found (%s)." % proj)
-        return
+# ----------------------------------------------------------------------------
+# Public CLI (bin/interrupted). The SessionStart hook invokes this script with NO
+# arguments and hook JSON on stdin; the CLI is therefore everything WITH arguments,
+# which is what keeps the two modes from ever being confused for one another.
+# ----------------------------------------------------------------------------
+
+# Claude Code returns roughly 30,000 characters of a successful command's output
+# inline before switching to a preview plus a saved file. Default a page just under
+# that so the common invocation stays readable in-session; --all opts out.
+CLI_MAX_CHARS_DEFAULT = int(os.environ.get("RESUME_INTERRUPTED_MAX_CHARS") or 26000)
+
+CLI_USAGE = """interrupted -- list the sessions in this project that were cut off mid-task.
+
+Usage:
+  interrupted                        list interrupted sessions, newest first
+  interrupted list [options]         the same, said explicitly
+  interrupted recommended [options]  only the session most worth resuming
+  interrupted --list [options]       compatibility alias for list
+
+Options:
+  --project PATH   read the project whose working directory is PATH, instead of
+                   the current directory. The transcript-directory encoding is
+                   done for you, so pass a real path such as "$HOME".
+  --dir DIR        read an already-encoded transcript directory directly
+                   (diagnostics; --project is the friendlier form).
+  --limit N        at most N sessions per page. 0 means no item limit.
+  --page N         which page to show, 1-based.
+  --max-chars N    end a page before it exceeds N characters (default %d).
+                   0 disables the character budget.
+  --all            no item and no character limit. For an ordinary terminal or a
+                   redirection; may exceed what Claude Code shows inline.
+  --json           complete machine-readable output. Never paginated.
+  -h, --help       this text.
+
+Read-only: no transcript and no recovery state is ever modified.
+""" % CLI_MAX_CHARS_DEFAULT
+
+
+# Room set aside for the two pagination-footer lines, so adding them can never be
+# what tips a page over its character budget.
+FOOTER_RESERVE = 120
+
+LIST_HEADER = "Interrupted sessions in this project (most recent first):\n"
+
+LIST_TRAILER = (
+    "\n  '>' = most likely the one to resume (most recent session with real work).\n"
+    "  [work] had substantive work; [probe] only an unanswered prompt — usually a failed\n"
+    "  availability check, but shown in case it was a real request typed on a dead connection.")
+
+
+class _CliError(Exception):
+    pass
+
+
+def _parse_cli(argv):
+    """Hand-rolled rather than argparse so that --list stays a first-class alias for
+    the list subcommand, and so an unrecognised flag is a loud error instead of a
+    silent no-op. argv is the full sys.argv."""
+    args = list(argv[1:])
+    opts = {"cmd": None, "project": None, "dir": None, "limit": 0, "page": 1,
+            "max_chars": CLI_MAX_CHARS_DEFAULT, "json": False, "all": False}
+    if args and args[0] in ("list", "recommended", "help"):
+        opts["cmd"] = args.pop(0)
+    valued = {"--project": "project", "--dir": "dir", "--limit": "limit",
+              "--page": "page", "--max-chars": "max_chars"}
+    while args:
+        a = args.pop(0)
+        if a in valued:
+            key = valued[a]
+            if not args:
+                raise _CliError("%s needs a value" % a)
+            v = args.pop(0)
+            if key in ("limit", "page", "max_chars"):
+                try:
+                    v = int(v)
+                except ValueError:
+                    raise _CliError("%s needs a whole number, not %s" % (a, v))
+                floor = 1 if key == "page" else 0
+                if v < floor:
+                    raise _CliError("%s must be %d or more" % (a, floor))
+            opts[key] = v
+        elif a == "--list":
+            if opts["cmd"] is None:
+                opts["cmd"] = "list"
+        elif a == "--json":
+            opts["json"] = True
+        elif a == "--all":
+            opts["all"] = True
+            opts["limit"] = 0
+            opts["max_chars"] = 0
+        elif a in ("-h", "--help"):
+            opts["cmd"] = "help"
+        else:
+            raise _CliError("unknown argument %s (try: interrupted --help)" % a)
+    if opts["cmd"] is None:
+        opts["cmd"] = "list"
+    return opts
+
+
+def _resolve_project_dir(opts):
+    """--dir wins (it is already encoded), then --project (encoded here), then cwd."""
+    if opts.get("dir"):
+        return opts["dir"]
+    if opts.get("project"):
+        return os.path.join(_projects_root(), _encode_project_path(opts["project"]))
+    return _project_dir_from_cwd()
+
+
+def _collect_rows(proj):
+    """All interrupted sessions newest-first, plus the recommended one.
+
+    The recommendation is derived from the COMPLETE set, never from a page, so
+    paginating can never move or lose the '>' marker."""
     rows = []
     for f in _prior_files(proj, current_sid=""):
         info = classify(f)
         if info["interrupted"]:
             rows.append((f, info))
-    if not rows:
-        print("No interrupted sessions found in this project.")
-        return
     rec_path = None
-    for f, info in rows:  # rows are newest-first; first substantive interrupted = recommendation
+    for f, info in rows:  # newest-first: first substantive interrupted is the pick
         if info["has_work"]:
             rec_path = f
             break
-    print("Interrupted sessions in this project (most recent first):\n")
-    for f, info in rows:
-        mark = "> RECOMMENDED" if f == rec_path else "             "
-        kind = "work " if info["has_work"] else "probe"
-        note = " downtime-note" if info.get("is_downtime_note") else ""
-        d = _norm(info["dangling"])[:80]
-        # work-turn count (item 3, inspired by native /resume's message count) + downtime-note flag
-        print("  %s  %s  [%s]  %2dwt  %-10s%s  \"%s\"" % (
-            mark, _session_time_str(f), kind, info.get("work_count", 0), info["reason"], note, d))
-        # Surface every note queued into that session during its down phase, so multi-note
-        # queues aren't lost to the single trailing quote above (each is a candidate follow-up).
-        queued = queued_prompts(_records(f))
-        for note in queued:
-            print("                   · queued: \"%s\"" % (_norm(note)[:90]))
-    print("\n  '>' = most likely the one to resume (most recent session with real work).")
-    print("  [work] had substantive work; [probe] only an unanswered prompt — usually a failed")
-    print("  availability check, but shown in case it was a real request typed on a dead connection.")
+    return rows, rec_path
+
+
+def _render_row(f, info, rec_path):
+    """One session's lines, as a single string with no trailing newline."""
+    mark = "> RECOMMENDED" if f == rec_path else "             "
+    kind = "work " if info["has_work"] else "probe"
+    note = " downtime-note" if info.get("is_downtime_note") else ""
+    lines = ["  %s  %s  [%s]  %2dwt  %-10s%s  \"%s\"" % (
+        mark, _session_time_str(f), kind, info.get("work_count", 0),
+        info["reason"], note, _norm(info["dangling"])[:80])]
+    # Every note queued during the down phase, so a multi-note queue isn't lost to
+    # the single trailing quote above (each is a candidate follow-up).
+    for q in queued_prompts(_records(f)):
+        lines.append("                   · queued: \"%s\"" % (_norm(q)[:90]))
+    return "\n".join(lines)
+
+
+def _paginate(blocks, limit, max_chars, page):
+    """Slice pre-rendered blocks into pages by BOTH an item count and a character
+    budget, whichever binds first. Returns (page_blocks, start_index, has_more).
+
+    Character-bounded pages are why this is not a simple list slice: title and
+    queued-note lengths vary, so a fixed item count either wastes the budget or
+    overshoots it. A block always lands whole -- one session is never split across
+    a page boundary. A single oversized block is still emitted alone, so no session
+    can be silently unreachable."""
+    pages = []
+    cur, cur_chars = [], 0
+    for b in blocks:
+        n = len(b) + 1
+        over_items = limit and len(cur) >= limit
+        over_chars = max_chars and cur and (cur_chars + n) > max_chars
+        if over_items or over_chars:
+            pages.append(cur)
+            cur, cur_chars = [], 0
+        cur.append(b)
+        cur_chars += n
+    if cur or not pages:
+        pages.append(cur)
+    idx = page - 1
+    if idx >= len(pages):
+        return [], sum(len(p) for p in pages), False
+    start = sum(len(p) for p in pages[:idx])
+    return pages[idx], start, idx + 1 < len(pages)
+
+
+def _next_page_cmd(opts, page):
+    """The exact command that shows the next page, echoing the options in force."""
+    parts = ["interrupted", "list"]
+    if opts.get("project"):
+        parts.append("--project %s" % opts["project"])
+    if opts.get("dir"):
+        parts.append("--dir %s" % opts["dir"])
+    if opts.get("limit"):
+        parts.append("--limit %d" % opts["limit"])
+    if opts.get("max_chars") != CLI_MAX_CHARS_DEFAULT:
+        parts.append("--max-chars %d" % opts["max_chars"])
+    parts.append("--page %d" % page)
+    return " ".join(parts)
+
+
+def _row_json(f, info, rec_path):
+    return {"path": f,
+            "session_id": os.path.splitext(os.path.basename(f))[0],
+            "time": _session_time_str(f),
+            "kind": "work" if info["has_work"] else "probe",
+            "work_count": info.get("work_count", 0),
+            "reason": info["reason"],
+            "is_downtime_note": bool(info.get("is_downtime_note")),
+            "dangling": _norm(info["dangling"]),
+            "queued": [_norm(q) for q in queued_prompts(_records(f))],
+            "recommended": f == rec_path}
+
+
+def _cli(argv):
+    """The public `interrupted` command. Read-only throughout."""
+    try:
+        opts = _parse_cli(argv)
+    except _CliError as e:
+        sys.stderr.write("interrupted: %s\n" % e)
+        return 2
+
+    if opts["cmd"] == "help":
+        sys.stdout.write(CLI_USAGE)
+        return 0
+
+    proj = _resolve_project_dir(opts)
+    if not os.path.isdir(proj):
+        if opts["json"]:
+            print(json.dumps({"project_dir": proj, "total": 0, "items": [],
+                              "error": "no such project transcript directory"}))
+        else:
+            print("No project transcript directory found (%s)." % proj)
+        return 0
+
+    rows, rec_path = _collect_rows(proj)
+
+    if opts["cmd"] == "recommended":
+        rec = [(f, i) for f, i in rows if f == rec_path]
+        if opts["json"]:
+            print(json.dumps({"project_dir": proj,
+                              "recommended": _row_json(rec[0][0], rec[0][1], rec_path)
+                              if rec else None}))
+        elif rec:
+            print(_render_row(rec[0][0], rec[0][1], rec_path))
+        else:
+            print("No interrupted session with substantive work in this project.")
+        return 0
+
+    if opts["json"]:
+        # Never paginated: the JSON contract is the complete set.
+        print(json.dumps({"project_dir": proj, "total": len(rows),
+                          "items": [_row_json(f, i, rec_path) for f, i in rows]}))
+        return 0
+
+    if not rows:
+        print("No interrupted sessions found in this project.")
+        return 0
+
+    blocks = [_render_row(f, i, rec_path) for f, i in rows]
+    # The budget is a ceiling on the WHOLE output, so the fixed header, trailer and
+    # pagination footer are charged to it rather than being allowed to push a page
+    # over the edge.
+    budget = opts["max_chars"]
+    if budget:
+        budget = max(1, budget - (len(LIST_HEADER) + len(LIST_TRAILER) + FOOTER_RESERVE))
+    shown, start, has_more = _paginate(blocks, opts["limit"], budget, opts["page"])
+    if not shown:
+        print("Page %d is past the end (%d session(s) total)." % (opts["page"], len(rows)))
+        return 0
+
+    parts = [LIST_HEADER]
+    parts.extend(shown)
+    if start or has_more:
+        parts.append("\n  Showing %d-%d of %d." % (start + 1, start + len(shown), len(rows)))
+        if has_more:
+            parts.append("  Next: %s" % _next_page_cmd(opts, opts["page"] + 1))
+    parts.append(LIST_TRAILER)
+    text = "\n".join(parts)
+    if opts["max_chars"] and len(text) > opts["max_chars"]:
+        # A page always carries at least one WHOLE session, so a budget too small to
+        # hold one session plus the fixed header cannot be honoured. Shipping the
+        # session and saying so beats both a silent overshoot and a session that no
+        # page could ever reach.
+        text += ("\n  (--max-chars %d is smaller than one session plus this header, "
+                 "so one session is shown anyway.)" % opts["max_chars"])
+    print(text)
+    return 0
+
+
+def _run_list(argv):
+    """Retained entry point for --list. The CLI supersedes it; kept so anything
+    calling it directly keeps working."""
+    return _cli(argv)
 
 
 def _banner_flag_dir():
@@ -806,14 +1062,31 @@ def _run_auto():
 
 
 def main():
-    if "--list" in sys.argv:
-        _run_list(sys.argv)
-    else:
-        _run_auto()
+    # The SessionStart hook invokes this with NO arguments and hook JSON on stdin,
+    # so anything carrying arguments is the public `interrupted` CLI. An empty argv
+    # always stays hook mode -- that is what keeps the hook contract intact.
+    if len(sys.argv) > 1:
+        return _cli(sys.argv)
+    _run_auto()
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        pass
+    if len(sys.argv) > 1:
+        # CLI mode: a real command must report a real failure, so nothing is
+        # swallowed here. The catch below is for the HOOK path only, where an
+        # unhandled traceback would land in the user's session start.
+        try:
+            sys.exit(main() or 0)
+        except BrokenPipeError:
+            # `interrupted | head` closes the pipe early. That is ordinary use of a
+            # paginated command, not a failure. os._exit skips the interpreter's
+            # exit-time flush, which would otherwise raise on the same dead pipe.
+            os._exit(0)
+        except KeyboardInterrupt:
+            os._exit(130)
+    else:
+        try:
+            main()
+        except Exception:
+            pass

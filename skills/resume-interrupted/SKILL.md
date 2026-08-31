@@ -120,27 +120,41 @@ you've had a clean working session (it won't nag). When the user wants to see ev
 they might not have picked back up — "what did I leave unfinished?", "list interrupted
 sessions", "show me past sessions to resume" — run the detector in list mode.
 
-> **Path caveat — do not paste `$CLAUDE_PLUGIN_ROOT` into the Bash tool.** That variable
-> is set only while a *hook* runs; it is **empty in the Bash-tool shell**, so
-> `"$CLAUDE_PLUGIN_ROOT/hooks/detect-interrupted.py"` resolves to `/hooks/...` and fails
-> with "No such file". Build an absolute path instead. The `hooks/` dir sits **two levels
-> up** from this skill's base directory (the "Base directory for this skill" path shown
-> when the skill loaded), so use:
->
-> ```
-> python3 "<SKILL_BASE_DIR>/../../hooks/detect-interrupted.py" --list
-> ```
->
-> If you don't have the base dir handy, resolve the newest installed copy (version- and
-> marketplace-agnostic):
+```
+interrupted
+```
+
+That is the whole command. Claude Code puts an enabled plugin's `bin/` directory on the
+Bash tool's `PATH`, so no path construction is needed — and **do not build one**. In
+particular, do not paste `$CLAUDE_PLUGIN_ROOT`: it is set only while a *hook* runs and is
+**empty in the Bash-tool shell**, so `"$CLAUDE_PLUGIN_ROOT/hooks/..."` resolves to
+`/hooks/...` and fails with "No such file".
+
+Useful variants:
+
+```
+interrupted recommended                 # just the one most worth resuming
+interrupted --project "$HOME"           # a different project, by its real path
+interrupted --limit 10                  # page a long list
+interrupted --json                      # complete machine-readable output
+interrupted --help                      # the full surface
+```
+
+Pass `--project <path>` with the project's **real working directory**; the command does
+Claude Code's transcript-directory encoding itself, so never hand-build a
+`~/.claude/projects/-Users-…` path. (`--dir` still takes an already-encoded directory if
+you have one.)
+
+> **Fallback, only if `interrupted: command not found`** — that means the plugin's `bin/`
+> isn't on `PATH` (an older Claude Code, or the plugin isn't enabled). Then call the
+> script directly, resolving the newest installed copy version- and marketplace-agnostically:
 >
 > ```
 > python3 "$(ls -dt ~/.claude/plugins/cache/*/resume-interrupted/*/hooks/detect-interrupted.py | head -1)" --list
 > ```
 
-(Add `--dir <project transcripts dir>` to target a specific project.) It prints
-every interrupted session, most recent first, and marks the most likely resume candidate
-with `>`. Present it as a short table and ask which one to jump back into.
+It prints every interrupted session, most recent first, and marks the most likely resume
+candidate with `>`. Present it as a short table and ask which one to jump back into.
 
 **Probe transparency:** sessions whose only content is a single unanswered prompt are
 labelled `[probe]` (usually a failed "are we back yet?" availability check). They're the

@@ -16,9 +16,9 @@ cracks. This plugin recovers it from the transcript.
 - A bundled **skill** (`resume-interrupted`) carries the recovery procedure: locate the
   transcript, read its tail, reconstruct intent, and continue — invoked on the notice or
   whenever you say "continue" / "pick up where we left off".
-- **Browse mode:** ask Claude to "list interrupted sessions" (or run
-  `hooks/detect-interrupted.py --list`) to see *every* unresumed session — most recent
-  first, recommendation marked — so you can jump back into any of them, not just the last.
+- **Browse mode:** run `interrupted` (or ask Claude to "list interrupted sessions") to see
+  *every* unresumed session — most recent first, recommendation marked — so you can jump
+  back into any of them, not just the last.
 
 ### Re-offering vs. nagging
 
@@ -97,6 +97,48 @@ Any other plugin's SessionStart hook may poll for that file (with its own short,
 to sequence its own banner after this one — resume-interrupted itself never checks for or waits on
 anything from the other side. waypoints does exactly this, so resume-interrupted's banner (when it
 has one) reliably lands before waypoints'.
+
+## The `interrupted` command
+
+Browse mode is also a plain command. Claude Code puts an enabled plugin's `bin/` directory
+on the Bash tool's `PATH`, so `interrupted` works with **no plugin path, no environment
+variables, and no model round-trip** — including from Claude Code's shell mode:
+
+```
+! interrupted
+```
+
+```
+interrupted                        # list interrupted sessions, newest first
+interrupted list                   # the same, said explicitly
+interrupted recommended            # only the session most worth resuming
+interrupted --list                 # compatibility alias for `list`
+```
+
+Options:
+
+| Option | What it does |
+| --- | --- |
+| `--project PATH` | Read the project whose working directory is `PATH` instead of the current one. The transcript-directory encoding is done for you, so pass a real path such as `"$HOME"` — never a hand-built `~/.claude/projects/-Users-…` path. |
+| `--dir DIR` | Read an already-encoded transcript directory (diagnostics; `--project` is the friendlier form). |
+| `--limit N` / `--page N` | Page by item count. The footer names the total and prints the exact next-page command. |
+| `--max-chars N` | End a page before it exceeds `N` characters (default 26000). Because titles and queued notes vary in length, a character budget uses the available space better than a fixed item count. `0` disables it. |
+| `--all` | No item and no character limit — for an ordinary terminal or a redirection. |
+| `--json` | Complete machine-readable output. **Never paginated**, so it stays a stable contract. |
+
+Three guarantees worth knowing, because each is enforced by a test:
+
+- **The recommendation is computed from the complete set, never from a page** — paginating
+  can't move or duplicate the `>` marker.
+- **No session is ever silently unreachable.** A page always carries at least one whole
+  session; if the character budget is too small to hold even one, the session still ships
+  and the output *says* the budget couldn't be honoured rather than overshooting quietly.
+- **Read-only throughout.** No transcript and no recovery state is modified.
+
+The `interrupted` command and the plugin's SessionStart hook are the same file in two
+modes, split on one rule: **no arguments means hook mode** (the hook is invoked with none,
+and reads its JSON from stdin), so anything with arguments is the CLI. `--list` keeps
+behaving exactly as it always did.
 
 ## Install
 

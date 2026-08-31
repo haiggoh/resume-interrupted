@@ -515,5 +515,220 @@ check(r["stale"] is False,
 del os.environ["RESUME_INTERRUPTED_RESET_UTC_HOUR"]
 del os.environ["RESUME_INTERRUPTED_RESET_PROPAGATION_MIN"]
 
+# ---------------------------------------------------------------------------
+# v0.4.0 -- the public `interrupted` CLI (bin/interrupted + the argument surface)
+#
+# Two contracts are load-bearing here and each has its own test below:
+#   * argv EMPTY stays SessionStart-hook mode (the hook passes no arguments);
+#   * `--list` keeps working exactly as before.
+# ---------------------------------------------------------------------------
+print("\n== v0.4.0: bin/interrupted launcher ==")
+
+LAUNCHER = os.path.join(HERE, "..", "bin", "interrupted")
+
+
+def runx(argv, cmd=None, cwd=None, stdin=""):
+    """Like run(), but keeps stderr and the exit code -- a CLI has both."""
+    r = subprocess.run((cmd or [sys.executable, SCRIPT]) + argv, input=stdin,
+                       capture_output=True, text=True, cwd=cwd)
+    return r.stdout, r.stderr, r.returncode
+
+
+def launch(argv, cwd=None, link=None):
+    return runx(argv, cmd=[link or LAUNCHER], cwd=cwd)
+
+
+check(os.path.exists(LAUNCHER), "bin/interrupted exists")
+check(os.access(LAUNCHER, os.X_OK), "bin/interrupted is executable")
+mode = subprocess.run(["git", "ls-files", "-s", "bin/interrupted"],
+                      cwd=os.path.join(HERE, ".."), capture_output=True, text=True).stdout
+check(mode.startswith("100755"), "bin/interrupted is mode 100755 in git, not just on disk")
+
+d = proj_with([("work.jsonl", WORK, 1000), ("probe.jsonl", PROBE, 2000)])
+
+# The launcher supplies --list when given no arguments, because the Python file
+# defaults to hook mode and would otherwise sit waiting on stdin.
+bare, _, rc_bare = launch(["--dir", d])
+listed, _, rc_list = launch(["list", "--dir", d])
+explicit, _, rc_expl = launch(["--list", "--dir", d])
+check(rc_bare == 0 and "RECOMMENDED" in bare, "no-argument launcher lists (browse is the CLI default)")
+check(bare == listed, "bare invocation == explicit `list` subcommand")
+check(bare == explicit, "`--list` is a faithful compatibility alias for `list`")
+
+# Symlink resolution: the launcher derives the plugin root from its own real path,
+# so every indirection a user or an installer might introduce must still work.
+tmp = tempfile.mkdtemp()
+absl = os.path.join(tmp, "abs-interrupted")
+os.symlink(os.path.abspath(LAUNCHER), absl)
+chain = os.path.join(tmp, "chain-interrupted")
+os.symlink(absl, chain)                                  # link -> link -> real file
+spacedir = os.path.join(tmp, "dir with spaces")
+os.mkdir(spacedir)
+spaced = os.path.join(spacedir, "interrupted")
+os.symlink(os.path.abspath(LAUNCHER), spaced)
+reldir = os.path.join(tmp, "rel")
+os.mkdir(reldir)
+rel = os.path.join(reldir, "rel-interrupted")
+os.symlink(os.path.join("..", "abs-interrupted"), rel)   # RELATIVE link into the chain
+
+for label, link in (("absolute symlink", absl), ("two-deep link chain", chain),
+                    ("relative symlink into that chain", rel),
+                    ("path containing spaces", spaced)):
+    out, err, rc = launch(["--dir", d], link=link)
+    check(rc == 0 and out == bare, "resolves through a %s" % label)
+
+# cwd must not matter once --dir/--project is explicit.
+out_home, _, _ = launch(["--dir", d], cwd=os.path.expanduser("~"))
+out_other, _, _ = launch(["--dir", d], cwd=tmp)
+check(out_home == bare and out_other == bare,
+      "same output from $HOME and from an unrelated directory (--dir wins over cwd)")
+
+# A launcher whose Python file is missing must fail loudly, not silently print nothing.
+broken_root = tempfile.mkdtemp()
+os.mkdir(os.path.join(broken_root, "bin"))
+broken = os.path.join(broken_root, "bin", "interrupted")
+with open(LAUNCHER) as fh:
+    open(broken, "w").write(fh.read())
+os.chmod(broken, 0o755)
+out, err, rc = launch(["--dir", d], link=broken)
+check(rc != 0, "a launcher with no hooks/detect-interrupted.py exits non-zero")
+
+print("== v0.4.0: hook mode is still what happens with NO arguments ==")
+out, err, rc = runx([], stdin=json.dumps({"transcript_path": os.path.join(d, "NEW.jsonl"),
+                                          "session_id": "NEW", "source": "startup"}))
+check(rc == 0 and out.strip().startswith("{"),
+      "empty argv + hook JSON on stdin still emits the SessionStart JSON, not CLI text")
+check("systemMessage" in json.loads(out), "hook JSON still carries systemMessage")
+out, _, rc = runx([], stdin="not json")
+check(rc == 0 and out.strip() == "", "garbage stdin still exits 0 with no output (never blocks)")
+
+print("== v0.4.0: --project encodes the path so the user never hand-builds one ==")
+check(detect._encode_project_path("/Users/me/Work.dir") == "-Users-me-Work-dir",
+      "path encoding replaces both separators and dots")
+check(detect._encode_project_path("~") == detect._encode_project_path(os.path.expanduser("~")),
+      "--project expands ~ before encoding")
+check(detect._resolve_project_dir({"dir": "/enc/dir", "project": "/Users/me"}) == "/enc/dir",
+      "--dir wins over --project (it is already encoded)")
+check(detect._resolve_project_dir({"project": "/Users/me"}).endswith("-Users-me"),
+      "--project is encoded and joined onto the projects root")
+out, _, rc = launch(["list", "--project", "/definitely/no/such/place"])
+check(rc == 0 and "No project transcript directory found" in out,
+      "an unknown --project says so plainly and still exits 0")
+
+print("== v0.4.0: recommended subcommand ==")
+out, _, rc = launch(["recommended", "--dir", d])
+check(rc == 0 and "RECOMMENDED" in out and out.count("\n") <= 2,
+      "`recommended` prints just the one session")
+check("are we back yet?" not in out, "`recommended` omits probes")
+probes_only = proj_with([("p1.jsonl", PROBE, 1000), ("p2.jsonl", PROBE, 2000)])
+out, _, rc = launch(["recommended", "--dir", probes_only])
+check(rc == 0 and "No interrupted session with substantive work" in out,
+      "`recommended` with only probes says so instead of guessing")
+
+print("== v0.4.0: pagination is bounded by BOTH items and characters ==")
+many = proj_with([("s%02d.jsonl" % i, WORK, 1000 + i) for i in range(12)])
+full, _, _ = launch(["list", "--dir", many])
+check(full.count("wt  ") == 12, "all 12 sessions on one page by default")
+check("Showing" not in full, "no pagination footer when everything fits")
+p1, _, _ = launch(["list", "--dir", many, "--limit", "5"])
+check(p1.count("wt  ") == 5, "--limit 5 shows 5")
+check("Showing 1-5 of 12." in p1, "footer states the window and the total")
+check("--page 2" in p1, "footer gives the exact next-page command")
+seen = 0
+page = 1
+while True:
+    out, _, _ = launch(["list", "--dir", many, "--limit", "5", "--page", str(page)])
+    if "past the end" in out:
+        break
+    seen += out.count("wt  ")
+    if "Next: " not in out:
+        break
+    page += 1
+check(seen == 12, "walking every page yields all 12 sessions -- none silently dropped")
+out, _, _ = launch(["list", "--dir", many, "--limit", "5", "--page", "9"])
+check("past the end" in out and "12 session" in out,
+      "a page past the end says so and names the total")
+
+# The character budget is the shell-mode ceiling, so it must bound the WHOLE output.
+for mc in (400, 900, 2000):
+    seen, page, over = 0, 1, False
+    while True:
+        out, _, _ = launch(["list", "--dir", many, "--max-chars", str(mc), "--page", str(page)])
+        if "past the end" in out:
+            break
+        # Below the irreducible floor (header + trailer + one whole session) the
+        # budget cannot be honoured; the CLI must then SAY so rather than overshoot
+        # quietly, so an overshoot only counts as a failure if it went unannounced.
+        if len(out) > mc and "is smaller than one session" not in out:
+            over = True
+        seen += out.count("wt  ")
+        if "Next: " not in out:
+            break
+        page += 1
+    check(not over, "--max-chars %d: no page overshoots the budget unannounced" % mc)
+    check(seen == 12, "--max-chars %d: still reaches all 12 sessions" % mc)
+out, _, _ = launch(["list", "--dir", many, "--max-chars", "1", "--page", "1"])
+check(out.count("wt  ") == 1,
+      "an absurdly small budget still emits one whole session, never zero (no unreachable item)")
+check("is smaller than one session" in out,
+      "and it says the budget could not be honoured instead of overshooting silently")
+out, _, _ = launch(["list", "--dir", many, "--all"])
+check(out == full, "--all removes both limits")
+
+print("== v0.4.0: pagination cannot move the recommendation ==")
+mixed = proj_with([("probe%02d.jsonl" % i, PROBE, 1000 + i) for i in range(6)]
+                  + [("work.jsonl", WORK, 500)])
+p1, _, _ = launch(["list", "--dir", mixed, "--limit", "2", "--page", "1"])
+last, _, _ = launch(["list", "--dir", mixed, "--limit", "2", "--page", "4"])
+check("RECOMMENDED" not in p1,
+      "the recommendation is NOT forced onto page 1 (it is the oldest row here)")
+check("RECOMMENDED" in last,
+      "the recommendation stays on the page its session actually falls on")
+allpages = "".join(launch(["list", "--dir", mixed, "--limit", "2", "--page", str(i)])[0]
+                   for i in range(1, 5))
+check(allpages.count("RECOMMENDED") == 1,
+      "exactly one recommendation across all pages (computed on the full set)")
+
+print("== v0.4.0: --json is the complete contract, never paginated ==")
+out, _, rc = launch(["--dir", many, "--json"])
+doc = json.loads(out)
+check(rc == 0 and doc["total"] == 12 and len(doc["items"]) == 12, "--json returns every item")
+out2, _, _ = launch(["list", "--dir", many, "--json", "--limit", "2"])
+check(len(json.loads(out2)["items"]) == 12, "--json ignores --limit (pagination is not silent)")
+row = doc["items"][0]
+for k in ("path", "session_id", "time", "kind", "work_count", "reason",
+          "is_downtime_note", "dangling", "queued", "recommended"):
+    check(k in row, "--json row has %s" % k)
+check(sum(1 for i in doc["items"] if i["recommended"]) == 1, "--json marks exactly one recommended")
+out, _, _ = launch(["recommended", "--dir", probes_only, "--json"])
+check(json.loads(out)["recommended"] is None,
+      "`recommended --json` returns null rather than omitting the key")
+out, _, _ = launch(["list", "--project", "/definitely/no/such/place", "--json"])
+check(json.loads(out)["total"] == 0, "--json on a missing project is still valid JSON")
+
+print("== v0.4.0: bad arguments fail loudly and safely ==")
+for argv, why in ((["--bogus"], "unknown flag"),
+                  (["list", "--page", "0"], "--page below 1"),
+                  (["list", "--limit", "abc"], "non-numeric --limit"),
+                  (["list", "--project"], "option with no value")):
+    out, err, rc = launch(argv)
+    check(rc == 2 and err.strip() != "" and out == "",
+          "%s -> exit 2, message on stderr, nothing on stdout" % why)
+out, err, rc = launch(["--help"])
+check(rc == 0 and "Usage:" in out and "--project" in out, "--help documents the surface")
+check("Read-only" in out, "--help states the read-only guarantee")
+
+print("== v0.4.0: read-only, and pipe-safe ==")
+before = sorted((f, os.path.getmtime(os.path.join(many, f))) for f in os.listdir(many))
+launch(["list", "--dir", many])
+launch(["--dir", many, "--json"])
+after = sorted((f, os.path.getmtime(os.path.join(many, f))) for f in os.listdir(many))
+check(before == after, "listing mutates no transcript (names and mtimes unchanged)")
+r = subprocess.run("%s --dir %s --json | head -c 40" % (LAUNCHER, many),
+                   shell=True, capture_output=True, text=True)
+check(r.returncode == 0 and "BrokenPipeError" not in r.stderr and "Traceback" not in r.stderr,
+      "`interrupted --json | head` closes the pipe without a traceback")
+
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
