@@ -6,6 +6,7 @@ SessionStart banner and the --list browse. No third-party deps.
 
 Usage: python3 tests/test_detect.py
 """
+import io
 import os, sys, json, tempfile, subprocess, importlib.util, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -79,9 +80,11 @@ check((not c["interrupted"]) and c["has_work"], "final turn that DISCUSSES an er
 # ...and the discussing turn still counts as substantive work (work-undercount fix).
 c = detect.classify(session([U("explain"), A(DISCUSS), LP("explain")]))
 check(c["has_work"], "a lone turn quoting an error phrase counts as real work")
-# Structural marker: isApiErrorMessage alone marks a kill even if the text isn't anchored.
+# Structural marker: isApiErrorMessage alone marks an error death even if the text isn't
+# anchored. The REASON is "api-error", not "limit-kill": an overload is not a quota refusal,
+# and calling it one made the resumed session warn about a budget that was never involved.
 c = detect.classify(session([U("go"), A("working"), AERR("Overloaded — gave up after 10 retries"), LP("go")]))
-check(c["interrupted"] and c["reason"] == "limit-kill", "isApiErrorMessage flag alone marks a kill")
+check(c["interrupted"] and c["reason"] == "api-error", "isApiErrorMessage flag alone marks an error death")
 # apiErrorStatus alone (no isApiErrorMessage, no matching wording) also marks a kill —
 # wording-agnostic structural detection, so error-message changes can't cause a false negative.
 AS = {"type": "assistant", "apiErrorStatus": 429,
@@ -728,6 +731,81 @@ r = subprocess.run("%s --dir %s --json | head -c 40" % (LAUNCHER, many),
                    shell=True, capture_output=True, text=True)
 check(r.returncode == 0 and "BrokenPipeError" not in r.stderr and "Traceback" not in r.stderr,
       "`interrupted --json | head` closes the pipe without a traceback")
+
+
+
+
+print("\n== v0.4.1: reason distinguishes a quota kill from a connection drop ==")
+# Regression: classify() used to return "limit-kill" for EVERY api-error death, so a wifi/DNS
+# drop told the next session a usage limit had been hit — feeding the exact budget misread the
+# resume notice is supposed to prevent. Wordings below are the literal strings measured in this
+# project's own transcripts (118 quota kills, all apiErrorStatus=429; every transport death
+# carrying no status at all), so these are ground truth rather than invented signatures.
+def AS_(t, status=None):
+    """Assistant error record with an optional apiErrorStatus, as the client writes it."""
+    r = {"type": "assistant", "isApiErrorMessage": True,
+         "message": {"role": "assistant", "content": [{"type": "text", "text": t}]}}
+    if status is not None:
+        r["apiErrorStatus"] = status
+    return r
+
+DROP = "API Error: Unable to connect to API (ENOTFOUND)"
+DNS = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"
+REFUSED = "API Error: Connection refused — a firewall or proxy may be blocking it"
+RESET = "API Error: Unable to connect to API (ECONNRESET)"
+STALL = "API Error: Response stalled mid-stream. The response above may be incomplete."
+BUSY = "API Error: 503 Server is busy (max concurrent requests reached). Retrying…"
+KILL429 = "API Error: Request rejected (429) · Budget has been exceeded! Key=Joyia"
+
+for label, rec in (("ENOTFOUND", AS_(DROP)), ("DNS wording", AS_(DNS)),
+                   ("connection refused", AS_(REFUSED)), ("ECONNRESET", AS_(RESET)),
+                   ("stalled stream", AS_(STALL))):
+    c = detect.classify(session([U("go"), A("working"), rec, LP("go")]))
+    check(c["interrupted"] and c["reason"] == "connection-drop",
+          "%s is a connection-drop, NOT a limit-kill" % label)
+
+c = detect.classify(session([U("go"), A("working"), AS_(KILL429, 429), LP("go")]))
+check(c["interrupted"] and c["reason"] == "limit-kill", "a real 429 budget refusal is a limit-kill")
+c = detect.classify(session([U("go"), A("working"), AS_(BUSY, 503), LP("go")]))
+check(c["interrupted"] and c["reason"] == "api-error", "a 503 busy-server refusal is an api-error")
+# Status wins over wording: a 429 is a quota refusal even if the text mentions the network.
+c = detect.classify(session([U("go"), A("working"), AS_("rate limited on the network edge", 429), LP("go")]))
+check(c["reason"] == "limit-kill", "apiErrorStatus=429 outranks transport wording")
+# Legacy transcripts predate the status field; a budget kill there must still be a limit-kill.
+c = detect.classify(session([U("go"), A("working"), A(BUDGET), LP("go")]))
+check(c["reason"] == "limit-kill", "legacy budget kill with NO status is still a limit-kill")
+
+print("\n== v0.4.1: the reset inference stays scoped to a real quota kill ==")
+# limit_constraint_stale answers "has a reset boundary passed" and is meaningful ONLY for a
+# quota kill. A connection drop used no quota, so the banner must not claim a limit reset.
+old = time.time() - 3 * 86400
+def _aged(recs):
+    p = session(recs); os.utime(p, (old, old)); return p
+
+def _banner(recs):
+    """Everything _emit_auto emits, as one string. It PRINTS the hook JSON rather than
+    returning it, so a returned value is None and every `not in` assertion against it would
+    pass vacuously — capture stdout instead."""
+    p = _aged(recs)
+    buf = io.StringIO()
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        detect._emit_auto(p, detect.classify(p), 0)
+    finally:
+        sys.stdout = real
+    return buf.getvalue()
+
+blob = _banner([U("do the thing"), A("started"), AS_(DROP), LP("do the thing")])
+check(blob.strip() != "" and "null" not in blob[:6], "the banner capture actually captured output")
+check("lost its connection" in blob, "connection-drop banner names the connection, not a limit")
+check("limit reset has passed" not in blob, "connection-drop banner claims NO limit reset")
+check("usage/limit error" not in blob, "connection-drop context does not assert a usage limit")
+check("a lost connection to the API" in blob, "connection-drop context names the real cause")
+
+blob429 = _banner([U("do the thing"), A("started"), AS_(KILL429, 429), LP("do the thing")])
+check("usage/API limit" in blob429, "limit-kill banner still names the limit")
+check("limit reset has passed" in blob429, "limit-kill 3 days old still reports the passed reset")
 
 
 print("\n%d passed, %d failed" % (passed, failed))

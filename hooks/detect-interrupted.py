@@ -47,10 +47,19 @@ just because no-hidden-changes is slow, absent, or the flag format changes. If
 no-hidden-changes isn't installed/enabled, no wait happens at all.
 
 Detection — a session was interrupted if EITHER:
-  (E) LIMIT KILL  the last assistant turn is an API/budget error — recognised by the
-                  transcript's own `isApiErrorMessage` marker, or (fallback) an error
+  (E) ERROR DEATH the last assistant turn is an API error — recognised by the transcript's
+                  own `isApiErrorMessage`/`apiErrorStatus` marker, or (fallback) an error
                   signature at the START of the turn. A turn that merely *discusses* an
-                  error phrase mid-text is NOT a kill.
+                  error phrase mid-text is NOT a kill. The KIND is then reported, because
+                  only one of the three carries a constraint into the next session:
+                    limit-kill       quota/budget refusal (429) — the provider said no, and
+                                     that fact expires at the next reset boundary.
+                    connection-drop  the request never reached the provider (DNS failure,
+                                     refused/reset socket, stalled stream). Nothing was used
+                                     up, so there is nothing to reset.
+                    api-error        reached the provider, which failed or was busy (5xx).
+                  Reporting all three as a limit kill is what made a resumed session warn
+                  about a budget that was never the problem.
   (S) STALLED     the final human input (last user record, or an orphaned last-prompt)
                   never received an assistant reply.
 
@@ -192,6 +201,61 @@ def _is_error_turn(rec, text):
     return _norm(text).startswith(ERROR_SIGNATURES)
 
 
+# Transport-failure wording. These are deaths where the request never reached the provider —
+# a DNS failure, a refused connection, a reset socket, a stream that stopped arriving. They
+# carry NO forward constraint: nothing has been used up, so there is nothing to reset. The
+# quota inference must never be applied to them.
+_TRANSPORT_SIGNATURES = (
+    "unable to connect", "can't reach the api", "cannot reach the api", "connection refused",
+    "enotfound", "econnreset", "econnrefused", "etimedout", "socket hang up",
+    "response stalled mid-stream", "the response stopped arriving", "network",
+)
+
+# Provider-side capacity refusals: the request DID reach the provider, which declined it.
+# Transient by nature and self-clearing without a reset boundary, so they are neither a
+# quota kill nor a transport failure.
+_BUSY_STATUSES = (500, 502, 503, 504, 529)
+
+
+def _error_kind(rec, text):
+    """Which KIND of error death this turn is: 'limit-kill' | 'connection-drop' | 'api-error'.
+
+    Only meaningful for a record `_is_error_turn` already accepted. The distinction matters
+    because ONE of the three carries a constraint into the next session: a quota kill means
+    "you are out of budget", which is true at the moment of death and false after the
+    provider's reset boundary. A dropped connection and a busy server mean nothing of the
+    kind — so labelling them 'limit-kill' makes the next session warn about a budget that
+    was never the problem, which is precisely the misread we tell the agent to avoid.
+
+    Decided on the STATUS CODE first, because it is structural and wording-independent; the
+    text is only consulted when the client recorded no status. Measured against this
+    project's own transcripts: all 118 real quota kills carry apiErrorStatus=429, while
+    every transport death (ENOTFOUND, ECONNRESET, connection refused, stalled stream)
+    carries no status at all — so the status field alone separates the two cleanly.
+    """
+    status = rec.get("apiErrorStatus")
+    if status is not None:
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            status = None
+    if status == 429:
+        return "limit-kill"
+    if status in _BUSY_STATUSES:
+        return "api-error"
+    s = _norm(text).lower()
+    if any(sig in s for sig in _TRANSPORT_SIGNATURES):
+        return "connection-drop"
+    if status is not None:
+        return "api-error"
+    # No status and no transport wording. Fall back to the quota signatures, which is where
+    # a legacy transcript's budget kill lands; anything else is an unclassified API error
+    # rather than an assumed quota kill.
+    if _norm(text).startswith(ERROR_SIGNATURES) or "usage limit" in s or "budget has been exceeded" in s:
+        return "limit-kill"
+    return "api-error"
+
+
 # Availability-probe noise the user types into a dead connection ("are we back yet?"). We
 # drop these when harvesting queued notes so real queued work isn't buried. Conservative:
 # only a SHORT message that is (or clearly contains) an availability check is dropped — a
@@ -286,7 +350,7 @@ def _is_continuation_stub(t):
 
 
 def classify(path):
-    """Return dict: interrupted, has_work, dangling, reason ('limit-kill'|'stalled'|''),
+    """Return dict: interrupted, has_work, dangling, reason ('limit-kill'|'connection-drop'|'api-error'|'stalled'|''),
     work_count (int: genuine assistant work turns), is_downtime_note (bool: the surfaced
     unanswered turn is a queued downtime note masked by a later continuation stub, i.e. not
     the primary session to resume — the primary-vs-downtime CHOICE stays in the orchestration
@@ -298,6 +362,7 @@ def classify(path):
     last_prompt = ""
     last_human_idx = -1              # last GENUINE (non-stub) human turn
     last_assistant_is_error = False
+    last_error_kind = ""             # kind of the LAST error turn seen (see _error_kind)
     work = 0
     human_ctx_is_stub = False        # is the current human context an auto-continuation stub?
     for i, o in enumerate(recs):
@@ -314,6 +379,8 @@ def classify(path):
         elif role == "assistant":
             at = _assistant_text(m)
             last_assistant_is_error = _is_error_turn(o, at)
+            if last_assistant_is_error:
+                last_error_kind = _error_kind(o, at)
             # A filler reply to a stub (assistant under stub context) is not real work.
             if at and not last_assistant_is_error and not human_ctx_is_stub:
                 work += 1
@@ -336,7 +403,10 @@ def classify(path):
                 "reason": reason, "work_count": work, "is_downtime_note": is_downtime_note}
 
     if last_assistant_is_error:
-        return _res(True, last_prompt or last_human, "limit-kill")
+        # The KIND of error death, not an assumed quota kill. Before this, every api-error
+        # death was labelled "limit-kill", so a dropped wifi connection told the next session
+        # a usage limit had been hit.
+        return _res(True, last_prompt or last_human, last_error_kind or "api-error")
     if last_human_idx >= 0:
         # "answered" = a GENUINE assistant reply after the last real human turn. A filler reply
         # under a continuation-stub context does NOT count (else the stub masks the real turn's
@@ -575,9 +645,20 @@ def _emit_auto(path, info, others):
     # "the request was never completed" (only true for a stall) would misreport it.
     # A limit kill carries a constraint forward; a stall does not. So the reset check runs
     # here and nowhere else (see limit_constraint_stale's caller contract).
+    # A quota kill is the ONLY reason that carries a constraint forward, so the reset check
+    # runs for it alone (see limit_constraint_stale's caller contract). A connection drop or
+    # a busy-server refusal used nothing up: there is no reset to have passed.
     fresh = limit_constraint_stale(path) if info["reason"] == "limit-kill" else None
     if info["reason"] == "limit-kill":
         line = "Last session (%s) was cut off by a usage/API limit mid-task." % ts
+        req = "Last request: \"%s\"" % d
+    elif info["reason"] == "connection-drop":
+        # Named for what it was. Reporting this as a limit made the next session warn about a
+        # budget that was never the problem — the exact misread the resume notice must avoid.
+        line = "Last session (%s) lost its connection to the API mid-task." % ts
+        req = "Last request: \"%s\"" % d
+    elif info["reason"] == "api-error":
+        line = "Last session (%s) was cut off by an API error mid-task." % ts
         req = "Last request: \"%s\"" % d
     else:
         line = "Last session (%s) left a request unanswered." % ts
@@ -600,12 +681,18 @@ def _emit_auto(path, info, others):
             lines.append("  · \"%s\"" % _quote(note, 90))
     lines += ["Say \"continue\" to resume, or \"list interrupted\" to browse.", rule]
     banner = "\n".join(lines)
+    # Name the cause the transcript actually recorded. The generic "usage-limit/API error"
+    # phrasing invited the agent to assume a quota problem after a mere network blip.
+    cause = {"limit-kill": "a usage/limit error",
+             "connection-drop": "a lost connection to the API",
+             "api-error": "an API error",
+             "stalled": "an unanswered prompt"}.get(info["reason"], "an unanswered prompt or API error")
     ctx = ("resume-interrupted: your most recent substantive session (%s) appears to have been "
-           "interrupted mid-task (unanswered prompt or usage-limit/API error), so no note that "
+           "interrupted mid-task (%s), so no note that "
            "the work was unfinished could be written at the time. Likely dangling request: \"%s\". "
            "Proactively offer to pick up where it left off — read the tail of that session's "
            "transcript to recover context, then continue. If the user has clearly moved on, "
-           "mention it once and don't push.%s" % (ts, d, extra))
+           "mention it once and don't push.%s" % (ts, cause, d, extra))
     if fresh:
         # The reason this matters: whatever limit stopped that session was a fact about a
         # PAST period. Carrying it into this one produces confident, wrong caution — the

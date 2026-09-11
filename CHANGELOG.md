@@ -18,6 +18,29 @@ would cite.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-11
+
+### Fixed
+- `reason` no longer reports every API-error death as a usage-limit kill. `classify()` returned
+  `"limit-kill"` unconditionally whenever the last assistant turn was an error, so a dropped wifi
+  connection told the next session a quota had been hit — feeding the exact budget misread this
+  plugin's own resume notice is meant to prevent. The reason now names what actually happened:
+  `limit-kill` (a 429 quota refusal, the only kind that carries a constraint into the next
+  session), `connection-drop` (the request never reached the provider — DNS failure, refused or
+  reset socket, stalled stream) or `api-error` (reached the provider, which failed or was busy).
+  The kind is decided on `apiErrorStatus` first, because a status code is structural and survives
+  a change of error wording; the message text is consulted only when no status was recorded.
+- The reset-staleness inference stays scoped to a real quota kill, so a connection drop no longer
+  produces an "a limit reset has passed" line about a limit that was never reached. The banner and
+  the model-facing context both name the real cause instead of the generic "usage-limit/API error".
+
+### Notes
+- Measured against 118 real quota kills and 15 transport deaths in live transcripts: every quota
+  refusal carried `apiErrorStatus=429` and every transport death carried no status at all, so the
+  status field alone separates them. Adding `ENOTFOUND` to `ERROR_SIGNATURES` — the obvious-looking
+  fix — would have been dead code: those turns are already detected structurally.
+- 16 new assertions (174 total), mutation-tested 5/5.
+
 _Nothing yet._
 
 ## [0.4.0] — 2026-08-31
