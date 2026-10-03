@@ -18,6 +18,13 @@ would cite.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-03
+
+### Added
+- A `shortcuts` file at the plugin root declares `interrupted`, so `get-haiggoh` (0.8.0 or
+  later) can put it on your own shell `PATH` through a version-independent shim. Nothing
+  changes for the command itself or for the Bash-tool `PATH` entry Claude Code already adds.
+
 ## [0.4.1] - 2026-09-11
 
 ### Fixed
