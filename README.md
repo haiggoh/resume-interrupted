@@ -108,6 +108,9 @@ variables, and no model round-trip** — including from Claude Code's shell mode
 ! interrupted
 ```
 
+In your own terminal, `get-haiggoh apply` (0.8.0 or later) puts `interrupted` on your shell
+`PATH` too, through the `shortcuts` file at this plugin's root.
+
 ```
 interrupted                        # list interrupted sessions, newest first
 interrupted list                   # the same, said explicitly
