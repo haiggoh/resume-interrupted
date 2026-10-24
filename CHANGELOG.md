@@ -18,6 +18,14 @@ would cite.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-25
+
+### Added
+- SKILL.md: how to find the right session when its last prompt is not a good hint — the
+  `interrupted` list orders by last prompt, so search transcripts by topic (`grep -l`
+  across the session files, then read the forks under the session's `subagents/`
+  directory).
+
 ## [0.5.1] - 2026-10-25
 
 ### Added

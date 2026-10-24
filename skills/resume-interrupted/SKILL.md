@@ -28,6 +28,11 @@ captured them is gone. Treating the note as a reminder of the *topic* rather tha
 of *decisions* re-derives findings at best and silently violates a recorded constraint at
 worst.
 
+To find the right session when its last prompt is not a good hint — the `interrupted` list
+orders by last prompt — search transcripts by topic instead: `grep -l` across the session
+files (`~/.claude/projects/*/*.jsonl`), then read the forks under the session's
+`subagents/` directory.
+
 ## How to recognize an interrupted session
 
 A session was interrupted (rather than ended intentionally) if **either**:
