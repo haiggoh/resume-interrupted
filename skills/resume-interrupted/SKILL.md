@@ -18,6 +18,16 @@ itself. This skill recovers that context and continues.
 - the general sentiment implies unfinished business from a recent session (not just that
   exact phrasing).
 
+## Before starting a task that has recorded history
+
+If the task you are picking up has history anywhere — an interrupted session, a to-do or
+follow-up note, a plan file, project notes — read that history **first**, before planning
+or re-deriving anything. A prior pass may already have found what you are about to look
+for, and the constraints the user recorded there still bind even though the session that
+captured them is gone. Treating the note as a reminder of the *topic* rather than a record
+of *decisions* re-derives findings at best and silently violates a recorded constraint at
+worst.
+
 ## How to recognize an interrupted session
 
 A session was interrupted (rather than ended intentionally) if **either**:
@@ -110,6 +120,11 @@ is exactly where the two can disagree and turn a correct verdict into a wrong on
    further — 3 is a floor, not a cap. Summarize what's unfinished (including any
    in-flight/aborted action found this way) back to the user *before* diving in, so they
    can confirm or redirect.
+   During a down phase the user often queues **several** notes into a stalled session, not
+   one — a single file can hold half a dozen unanswered prompts, and the trailing one is
+   not necessarily the most valuable. Harvest **every** unanswered user turn in the file
+   (skip slash-command echoes, tool results, and "still blocked?"-type probe noise), then
+   triage what you collected.
 5. **Continue** — pick up the task, or ask one crisp clarifying question if the intent is
    ambiguous. If the user has clearly moved on, mention the unfinished item once and drop it.
 
@@ -184,6 +199,16 @@ caught up. Skim the most recent one(s) for two things:
 Where those transcripts live, and the specific mistakes to look for, are environment-specific
 — record them in your project/user notes so this step is concrete rather than abstract.
 
+## A killed background workflow leaves a journal
+
+When the interrupted session died while a **background workflow** was running, its ephemeral
+task-output file is usually gone days later — but the workflow's own `journal.jsonl` (the
+resume journal) and the per-agent transcripts under the session's
+`subagents/workflows/<runId>/` directory survive, and they hold every completed `agent()`
+result. A completed-but-unsaved workflow output (drafted documents, findings, plans) can
+therefore be recovered from the journal even after the temp files are wiped. Check there
+before concluding the work is lost.
+
 ## Guardrails
 
 - **Verify, don't assume.** Confirm the interruption from the transcript before asserting
@@ -198,3 +223,11 @@ Where those transcripts live, and the specific mistakes to look for, are environ
   period means that limit is history. Reporting it as current is the same class of error as
   claiming there's nothing to resume without looking — a confident statement about a state
   you didn't check.
+- **Transcripts double as an instruction-file version history.** Every transcript embeds
+  the instruction file (CLAUDE.md or equivalent) that was active when the session ran, so
+  old transcripts are also a record of what rules were in force at the time — useful when
+  you need to prove what an earlier session was actually told to do.
+- **Session-summary files are not the user's words.** A summary written while the session
+  ran was produced by whatever model the session used, so a "quote" in it can be translated
+  or paraphrased. Before attributing words to the user, read the transcript's own user
+  records; the summary is a pointer, never the source.

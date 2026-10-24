@@ -7,6 +7,8 @@
   "manifest": ".claude-plugin/plugin.json",
   "changelog": "CHANGELOG.md",
 
+  "test_cmd": "python3 tests/test_detect.py && python3 tests/test_shortcuts.py",
+
 
 
   "refresh_plugin": "resume-interrupted"

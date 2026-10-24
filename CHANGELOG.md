@@ -18,6 +18,25 @@ would cite.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-25
+
+### Added
+- SKILL.md: read recorded history (an interrupted session, a to-do note, a plan) *before*
+  starting a task that has any — a prior pass's findings, and the constraints the user
+  recorded there, still bind.
+- SKILL.md: during a down phase, harvest *every* unanswered user turn queued in the stalled
+  session, not just the trailing one — users queue several notes, and the last is not
+  necessarily the most valuable.
+- SKILL.md: transcripts embed the instruction file that was active when they ran, so old
+  transcripts double as an instruction-file version history.
+- SKILL.md: a session killed mid-background-workflow leaves a `journal.jsonl` and per-agent
+  transcripts that outlive the ephemeral task output — recover completed-but-unsaved
+  workflow results from there before concluding the work is lost.
+- SKILL.md: session-summary files are not the user's words; read the transcript's own user
+  records before attributing a quote.
+- `docs/DESIGN.md`: the detection contract, de-dup decisions, independence directive and
+  shape rationale, so the plugin's design history is public and durable.
+
 ## [0.5.0] - 2026-10-03
 
 ### Added
