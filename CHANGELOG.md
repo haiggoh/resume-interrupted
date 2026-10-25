@@ -18,6 +18,12 @@ would cite.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-10-25
+
+### Fixed
+- Removed a stray `_Nothing yet._` line that the 2026-09-03 CHANGELOG reconstruction left
+  between the 0.4.1 and 0.4.0 sections. Cosmetic only; no entry changed.
+
 ## [0.5.2] - 2026-10-25
 
 ### Added
@@ -74,8 +80,6 @@ would cite.
   status field alone separates them. Adding `ENOTFOUND` to `ERROR_SIGNATURES` — the obvious-looking
   fix — would have been dead code: those turns are already detected structurally.
 - 16 new assertions (174 total), mutation-tested 5/5.
-
-_Nothing yet._
 
 ## [0.4.0] — 2026-08-31
 
