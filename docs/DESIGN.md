@@ -17,8 +17,9 @@ which was false: the transcripts were right there. Two realizations followed:
 
 ## Detection contract
 
-Interrupted if **(E)** the last assistant turn is an API/budget error, or **(S)** the final
-human input is unanswered / an orphaned `last-prompt`.
+Interrupted if **(E)** the last assistant turn is an API/budget error, **(M)** the last
+assistant turn emitted a `tool_use` that no later `tool_result` answers, or **(S)** the
+final human input is unanswered / an orphaned `last-prompt`.
 
 - **(E) keys on the transcript record's own structural markers** (`isApiErrorMessage` /
   `apiErrorStatus`), not error wording — wording-agnostic, so it survives error-text
@@ -28,12 +29,20 @@ human input is unanswered / an orphaned `last-prompt`.
   transport death carried no status at all, so the status field alone separates them.)
 - **Only the LAST assistant turn decides**, so a *recovered* mid-session error is not a
   kill.
-- **Mid-stream kills need no special rule.** A persisted assistant turn carries a terminal
-  `stop_reason`, so an interrupted stream leaves either no assistant turn (→ S) or an error
-  turn (→ E). The principled signal for a true partial would be a missing/`null`
-  `stop_reason`. **Never** detect truncation from prose shape (missing end-punctuation, an
+- **Mid-stream kills** mostly leave no assistant turn (→ S) or an error turn (→ E), but a
+  third shape exists: the turn's `tool_use` block persisted and the death beat the result
+  (→ M). **Never** detect truncation from prose shape (missing end-punctuation, an
   incomplete word): complete turns routinely end on a colon, a list item, a code fence or
   a bare tool call.
+- **Liveness is a hard exclusion, not a verdict modifier** (v0.6.0). A session whose
+  registry entry names a running process with a matching start time is never offered,
+  however dead its transcript tail looks (a busy autonomous session can go hours between
+  user turns). The start match compares `ps -o etime=` elapsed against the record's
+  `startedAt` epoch — NOT the `procStart` string, which can sit a timezone frame (an hour
+  on a DST boundary) away from ps's locale-formatted `lstart` (measured live, 2026-10-25).
+  `etimes` is Linux-only, which is why `etime` is parsed instead. When no registry can
+  answer, a transcript written within 10 minutes is hedged "may still be running", never
+  confidently stalled.
 - **Self-denoising.** Only the most recent *substantive* session (≥1 real assistant turn)
   is considered, so bare "are we back yet?" availability probes are skipped and the offer
   goes quiet once a clean substantive session exists. It is not one-shot: it re-appears
@@ -45,7 +54,10 @@ human input is unanswered / an orphaned `last-prompt`.
   dependency and its absence no-ops.
 - `queued_prompts()` harvests **every** unanswered human note queued after the last real
   assistant turn, not just the trailing one: during a down phase users queue several notes
-  into a stalled session.
+  into a stalled session. It also reads `queue-operation` records (v0.6.0): a prompt typed
+  mid-turn can exist ONLY as such a record (absorbed into the running turn — it never
+  becomes a user turn), so a user-role scan loses it entirely. Measured 2026-10-25 on
+  session 52a9a5bf.
 - `_orphaned_queued_notes()` surfaces notes trapped in dead-end probe sessions even when
   the full resume banner is suppressed — and it walks **newer** files than the clean top,
   because after an abrupt kill each retry creates a *new* session, so the dead ends land

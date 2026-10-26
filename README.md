@@ -36,6 +36,14 @@ A session was interrupted (not ended intentionally) if **either**:
 - **(S) Stalled** — the final human input never got an assistant reply (last prompt
   unanswered, or a prompt that only reached a trailing `last-prompt` marker). Covers
   crashes and dropped connections, not just metered-gateway limits.
+- **(M) Mid-tool kill** — the last assistant turn emitted a `tool_use` whose result never
+  arrived: the session died between the call and the tool's completion.
+
+And a session that is **still alive is never offered**: the launcher's live-session
+registry is consulted (a matching entry whose pid is running *and* whose recorded start
+time matches the process — a recycled pid is a different process wearing the same number).
+When no registry can answer, a transcript written in the last ~10 minutes is hedged as
+"may still be running" rather than confidently stalled.
 
 It is **self-denoising**: it only considers your most recent session that had *real work*
 (≥1 assistant turn), so bare "are we back yet?" availability probes during an outage are

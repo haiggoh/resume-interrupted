@@ -808,5 +808,153 @@ check("usage/API limit" in blob429, "limit-kill banner still names the limit")
 check("limit reset has passed" in blob429, "limit-kill 3 days old still reports the passed reset")
 
 
+print("\n== v0.6.0 (batch F): liveness — a LIVE session is never a resume candidate ==")
+# The registry records live sessions as <pid>.json with sessionId + startedAt (epoch ms).
+# A session is LIVE only on positive evidence: a registry entry whose pid is alive AND whose
+# start time matches (a recycled pid is a different process wearing the same number).
+REG = tempfile.mkdtemp()
+os.environ["RESUME_INTERRUPTED_SESSIONS_DIR"] = REG
+MY_PID = os.getpid()
+NOW_MS = time.time() * 1000
+
+
+def reg_entry(name, rec):
+    with open(os.path.join(REG, name), "w") as fh:
+        json.dump(rec, fh)
+
+
+def clear_reg():
+    for f in os.listdir(REG):
+        os.unlink(os.path.join(REG, f))
+
+
+reg_entry("me.json", {"pid": MY_PID, "sessionId": "sid-live", "startedAt": NOW_MS})
+check(detect.session_live("sid-live", REG) is True, "live: registry entry, pid alive, start matches")
+
+# Without the registry_dir argument the env override is honoured.
+check(detect.session_live("sid-live") is True, "env RESUME_INTERRUPTED_SESSIONS_DIR is honoured")
+check(detect.session_live("sid-unknown") is False, "no matching entry -> not live (never by default)")
+check(detect.session_live("") is False, "empty session id -> not live, never raises")
+
+reg_entry("dead.json", {"pid": 999999, "sessionId": "sid-dead", "startedAt": NOW_MS})
+check(detect.session_live("sid-dead", REG) is False, "dead pid -> not live (no os.kill match)")
+
+reg_entry("recycled.json", {"pid": MY_PID, "sessionId": "sid-recycled", "startedAt": NOW_MS - 3 * 3600 * 1000})
+check(detect.session_live("sid-recycled", REG) is False,
+      "pid-reuse guard: alive pid whose start time does NOT match the record -> not live")
+
+reg_entry("nostart.json", {"pid": MY_PID, "sessionId": "sid-nostart"})
+check(detect.session_live("sid-nostart", REG) is True,
+      "no startedAt recorded -> fails open (alive pid is enough; never read a live session as dead)")
+
+reg_entry("corrupt.json", None)  # unparseable
+with open(os.path.join(REG, "corrupt.json"), "w") as fh:
+    fh.write("{not json")
+check(detect.session_live("sid-live", REG) is True, "corrupt registry entry is skipped, others still consulted")
+clear_reg()
+check(detect.session_live("sid-live", REG) is False, "empty registry -> not live")
+
+print("== v0.6.0: the env override fails loudly when set but unusable ==")
+code = ("import importlib.util,os,sys;spec=importlib.util.spec_from_file_location("
+        "'d',%r);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);" % SCRIPT) + \
+       "os.environ['RESUME_INTERRUPTED_SESSIONS_DIR']='/definitely/no/such/dir';print(m.session_live('x'))"
+r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+check("RESUME_INTERRUPTED_SESSIONS_DIR" in r.stderr and "no such" in r.stderr.lower() or "not a directory" in r.stderr,
+      "an override that is set but invalid names itself on stderr (never a silent fallthrough)")
+check(r.stdout.strip() == "False", "and liveness answers False on no positive evidence, not by reading the default")
+os.environ["RESUME_INTERRUPTED_SESSIONS_DIR"] = REG
+
+print("== v0.6.0: live sessions are excluded from the listing and the recommendation ==")
+d = proj_with([("work.jsonl", WORK, NOW - 3 * HOUR)])
+reg_entry("other.json", {"pid": MY_PID, "sessionId": "work", "startedAt": time.time() * 1000})
+out, err, rc = launch(["list", "--dir", d])
+check(out.strip() == "" or "work" not in out, "a LIVE work session is not listed as interrupted")
+out, _, _ = launch(["recommended", "--dir", d])
+check("No interrupted session" in out, "a LIVE session is not recommended for resume")
+# Same transcript, dead pid -> listed again (the registry decides, nothing else changed).
+clear_reg()
+reg_entry("dead.json", {"pid": 999999, "sessionId": "work", "startedAt": NOW_MS})
+out, _, _ = launch(["list", "--dir", d])
+check("RECOMMENDED" in out, "the same session with a dead pid is listed again")
+
+print("== v0.6.0: registry absent -> a freshly written session says 'may still be running' ==")
+# The registry "cannot answer" is simulated with an override to a nonexistent dir (the same
+# code branch as an absent default registry) — the real default exists on this machine.
+os.environ["RESUME_INTERRUPTED_SESSIONS_DIR"] = "/definitely/no/such/dir"
+d = proj_with([("fresh.jsonl", WORK, time.time() - 30)])
+out, err, rc = launch(["list", "--dir", d])
+check("may still be running" in out, "fresh write + no registry -> 'may still be running', never a confident stalled verdict")
+out, _, _ = launch(["recommended", "--dir", d])
+check("No interrupted session" in out, "a may-still-be-running session is not recommended either")
+d = proj_with([("old.jsonl", WORK, time.time() - 2 * HOUR)])
+out, _, _ = launch(["list", "--dir", d])
+check("may still be running" not in out, "an old write with no registry gets no such hedge")
+
+print("== v0.6.0 (batch F): the mid-tool kill shape — (M) ==")
+TOOL = {"type": "assistant", "message": {"role": "assistant", "content": [
+    {"type": "text", "text": "running it"},
+    {"type": "tool_use", "id": "tu1", "name": "Bash", "input": {"command": "ls"}}]}}
+TOOL_RESULT = {"type": "user", "message": {"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": "tu1", "content": "out"}]}}
+c = detect.classify(session([U("go"), A("working"), TOOL]))
+check(c["interrupted"] and c["reason"] == "mid-tool",
+      "(M) a persisted tool_use with no tool_result after it = killed mid-tool (neither E nor S)")
+c = detect.classify(session([U("go"), A("working"), TOOL, TOOL_RESULT]))
+check(not c["interrupted"], "the result arriving completes the turn -> not mid-tool")
+c = detect.classify(session([U("go"), A("working"), TOOL, TOOL_RESULT,
+                             {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "next"}]}}]))
+check(c["interrupted"] and c["reason"] == "stalled", "a real prompt after a completed tool call is a stall, not mid-tool")
+# (E) outranks (M): an error turn is the stronger, constraint-carrying verdict.
+c = detect.classify(session([U("go"), A("working"), TOOL, AERR(BUDGET)]))
+check(c["reason"] == "limit-kill", "(E) an error turn after the tool_use still wins over mid-tool")
+# A text-only session is unaffected.
+c = detect.classify(session([U("go"), A("done"), LP("go")]))
+check(not c["interrupted"], "text-only clean session is not mid-tool")
+# The banner names the shape and carries no limit constraint.
+p = _aged([U("do the thing"), A("started"), TOOL])
+blob = _banner([U("do the thing"), A("started"), TOOL])
+check("tool call" in blob and "never returned its result" in blob,
+      "mid-tool banner names the shape (killed between the call and its result)")
+check("limit" not in blob.lower(), "mid-tool carries no limit constraint (no reset language)")
+
+print("== v0.6.0: the harvest also reads queue-operation records (prompts that never became turns) ==")
+# Real shape (session 52a9a5bf, 2026-10-25 15:11 UTC): a user message typed mid-turn was
+# absorbed into the running context and recorded ONLY as a queue-operation record — never a
+# user turn — so a harvest that reads user roles alone loses it entirely.
+QOP = {"type": "queue-operation", "operation": "remove", "reason": "absorbed_mid_turn",
+       "content": "Heads-up: the plan changed under you. Re-read the C0 amendment block before batch C."}
+Q = [U("build the thing"), A("starting"), QOP, LP("build the thing")]
+harvested = detect.queued_prompts(Q)
+check(any("C0 amendment" in h for h in harvested),
+      "a queue-operation record's content is harvested (it never became a user turn)")
+# Dedup: a queued message that ALSO arrived as a user turn must not be surfaced twice.
+QD = [U("build the thing"), A("starting"), QOP,
+      {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Heads-up: the plan changed under you. Re-read the C0 amendment block before batch C."}]}},
+      LP("build the thing")]
+check(detect.queued_prompts(QD).count("Heads-up: the plan changed under you. Re-read the C0 amendment block before batch C.") == 1,
+      "a queue record whose text also exists as a user turn is not duplicated")
+check(detect.queued_prompts([U("hi"), A("hi"), U("bye"), A("cya")]) == [],
+      "clean session: queue-record harvest adds nothing")
+
+print("== v0.6.0: mutation — each new mechanism is what fires ==")
+reg_entry("other.json", {"pid": MY_PID, "sessionId": "work", "startedAt": time.time() * 1000})
+d = proj_with([("work.jsonl", WORK, NOW - 3 * HOUR)])
+real_live = detect.session_live
+try:
+    detect.session_live = lambda sid, rd=None: False
+    out, _, _ = launch(["list", "--dir", d])
+finally:
+    detect.session_live = real_live
+check("RECOMMENDED" in out, "mutation: without the liveness check the live session IS listed (mechanism proven)")
+real_um = detect._unmatched_tool_use
+try:
+    detect._unmatched_tool_use = lambda recs: False
+    c = detect.classify(session([U("go"), A("working"), TOOL]))
+finally:
+    detect._unmatched_tool_use = real_um
+check(not c["interrupted"] and c["reason"] != "mid-tool",
+      "mutation: without the mid-tool check the shape reads as clean (mechanism proven)")
+os.environ["RESUME_INTERRUPTED_SESSIONS_DIR"] = REG
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

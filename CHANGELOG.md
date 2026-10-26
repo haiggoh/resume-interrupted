@@ -12,6 +12,32 @@ which is usually the previous release. Release dates are the date of the commit 
 `.claude-plugin/plugin.json` to that version. Entries therefore summarise recorded commits rather
 than reproducing notes written at release time.
 
+## [0.6.0] - 2026-10-26
+
+- **A live session is never offered as a resume candidate** (batch F). The launcher's
+  registry (`~/.claude/sessions/<pid>.json`) is consulted: a session is live only on
+  positive evidence — a matching entry whose pid is running AND whose recorded `startedAt`
+  matches the process (compared via `ps -o etime=`, since `etimes` is Linux-only and the
+  `procStart` string can sit a timezone frame away from ps's locale-formatted `lstart`;
+  measured live on this machine's DST boundary, 2026-10-25). Live sessions are excluded
+  from the recommendation, the orphaned-note walk and the listing.
+- **Registry can't answer ⇒ honest hedging**: a transcript written within 10 minutes is
+  reported as "may still be running" instead of a confident stalled verdict (`may_be_running`
+  in `--json`, a listing marker, and such sessions are not recommended either). An explicit
+  `RESUME_INTERRUPTED_SESSIONS_DIR` override that is set but invalid is named on stderr and
+  treated as absent for that run — never a silent fallthrough to the default.
+- **(M) mid-tool kills**: a session whose last assistant turn emitted a `tool_use` that no
+  later `tool_result` answers is now detected — a third structural shape beside (E)/(S).
+  Measured 2026-10-25: a 7-hour autonomous session died in exactly this shape, matched
+  neither (E) nor (S), and was invisible to every automated resume surface. New banner
+  wording; no limit constraint is inferred for it.
+- **Queue-record harvest**: `queued_prompts()` also reads `queue-operation` records — a
+  prompt typed mid-turn can exist ONLY as such a record (absorbed into the running turn,
+  never a user turn), so a user-role scan loses it entirely. Deduped against user turns.
+- Tests 174 → 201 (liveness fixtures: live / dead-pid / pid-reused / no-startedAt /
+  corrupt-json / invalid-override; mid-tool shapes; queue-record dedup; two mutation
+  checks), all in temp dirs — the real registry is never touched.
+
 **Tags.** Annotated tags exist from ``v0.3.0`` onward, each on the commit that set `plugin.json` to
 that version. Earlier versions are deliberately untagged: they are early-development releases nobody
 would cite.

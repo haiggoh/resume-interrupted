@@ -33,6 +33,13 @@ orders by last prompt — search transcripts by topic instead: `grep -l` across 
 files (`~/.claude/projects/*/*.jsonl`), then read the forks under the session's
 `subagents/` directory.
 
+A session the user names by its window title ("📡 <model> · <2 chars>") is found by
+content, never by the title: that suffix is a random per-launch disambiguator, not a
+session-id prefix (grepping for it as a filename finds weeks-old false hits). Scan
+transcript HEADS instead — each session's own records embed the 📡 window name and the
+`Actual model:` banner its launcher hook wrote, which survives even after the registry
+record is cleaned up on exit.
+
 ## How to recognize an interrupted session
 
 A session was interrupted (rather than ended intentionally) if **either**:
@@ -45,19 +52,33 @@ A session was interrupted (rather than ended intentionally) if **either**:
 - **(S) Stalled** — the final human input never got an assistant reply. Two shapes:
   the last human message has no assistant turn after it, **or** the final prompt exists
   only in a trailing `last-prompt` marker (interrupted before it became an answered turn).
+- **(M) Mid-tool kill** — the last assistant turn emitted a `tool_use` whose result never
+  arrived: the session died between the call and the tool's completion. Neither (E) (no
+  error turn — the death beat the API reply) nor (S) (the prompt WAS answered — work was
+  underway). Structural and wording-agnostic: a persisted `tool_use` id with no matching
+  `tool_result` anywhere after it.
 
 Distinguish real interrupted work from a bare **availability probe** ("are we back yet?"):
 a resumable session has **≥1 real assistant turn** before the interruption. A session that
 is *only* an unanswered prompt has nothing to resume — skip it and look at the next.
 
-**Mid-stream kills** (a reply cut off while streaming) need no special rule: a persisted
-assistant turn carries a terminal `stop_reason`, so an interrupted stream generally leaves
-either *no* assistant turn (→ falls to **(S)**) or an error turn (→ **(E)**) — both already
-covered. Do **not** try to detect truncation by missing end-punctuation or incomplete
-words: complete turns routinely end on a colon, a list item, a code fence, a number, or a
-tool call with no trailing text, so prose-shape matching false-positives. If a real
-interrupted-stream transcript ever surfaces, the principled signal is a missing/`null`
-`stop_reason` (deterministic), not prose shape.
+**Mid-stream kills** (a reply cut off while streaming) mostly need no special rule: a
+persisted assistant turn carries a terminal `stop_reason`, so an interrupted stream leaves
+either *no* assistant turn (→ **(S)**), an error turn (→ **(E)**), or a `tool_use` awaiting
+its result (→ **(M)**) — all covered. Do **not** try to detect truncation by missing
+end-punctuation or incomplete words: complete turns routinely end on a colon, a list item,
+a code fence, a number, or a tool call with no trailing text, so prose-shape matching
+false-positives. (Real case, 2026-10-25: a 7-hour autonomous session died between a Bash
+`tool_use` and its result, matched neither (E) nor (S), and was invisible to every
+automated resume surface — which is why (M) exists.)
+
+**A session that is still alive is never a resume candidate.** The launcher's registry
+(`~/.claude/sessions/<pid>.json`) records live sessions; the detector excludes them (pid
+alive **and** its recorded start time matching the process — a recycled pid is a different
+process wearing the same number). When no registry can answer, a transcript written in the
+last ~10 minutes is hedged as "may still be running" instead of confidently stalled. Never
+double-drive a session on that hedge: confirm from the registry or the terminal before
+writing anything it might also write.
 
 ## A limit kill carries a constraint — check whether it has expired
 
@@ -130,6 +151,11 @@ is exactly where the two can disagree and turn a correct verdict into a wrong on
    not necessarily the most valuable. Harvest **every** unanswered user turn in the file
    (skip slash-command echoes, tool results, and "still blocked?"-type probe noise), then
    triage what you collected.
+   Harvest `queue-operation` records too: a prompt typed mid-turn can exist ONLY as such a
+   record (absorbed into the running turn, never a user turn), and its content is the only
+   trace of what the user asked for. Also sweep the session's sidecar files, its
+   attachment records, and `~/.claude/history.jsonl` (filter by `sessionId`) for prompts
+   that never landed in the transcript at all.
 5. **Continue** — pick up the task, or ask one crisp clarifying question if the intent is
    ambiguous. If the user has clearly moved on, mention the unfinished item once and drop it.
 

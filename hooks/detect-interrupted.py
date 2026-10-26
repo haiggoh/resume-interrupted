@@ -87,7 +87,7 @@ unrecoverable by design; there is nothing for this script's logic to detect or r
 is a Claude Code platform behaviour, not a bug in this detector.
 """
 
-import sys, os, json, glob, time, datetime
+import sys, os, json, glob, time, datetime, subprocess
 
 ERROR_SIGNATURES = ("Budget has been exceeded", "API Error: Request rejected", "usage limit reached")
 
@@ -106,6 +106,140 @@ ERROR_SIGNATURES = ("Budget has been exceeded", "API Error: Request rejected", "
 # treated as reset yet. Both are configurable for providers on other schedules.
 RESET_UTC_HOUR = int(os.environ.get("RESUME_INTERRUPTED_RESET_UTC_HOUR") or 0)
 RESET_PROPAGATION_MIN = int(os.environ.get("RESUME_INTERRUPTED_RESET_PROPAGATION_MIN") or 10)
+
+# --- Live-session registry (v0.6.0) ---------------------------------------------------
+# Claude Code's launcher records each RUNNING session in ~/.claude/sessions/<pid>.json as
+# {pid, sessionId, startedAt (epoch ms), procStart, ...}. A session that is still alive must
+# never be offered as a resume candidate, whatever its transcript tail looks like: a busy
+# autonomous session can go hours between user turns, so a healthy-but-quiet session reads
+# exactly like a stalled one. When the registry cannot answer at all, a transcript written
+# within MAYBE_RUNNING_S is hedged as "may still be running" instead of confidently stalled.
+MAYBE_RUNNING_S = 600                 # no registry answered: a session written this recently MAY be alive
+START_MATCH_TOLERANCE_MS = 120_000    # ps-elapsed vs startedAt slack (clock rounding, ps sampling)
+_registry_warned = {"done": False}
+
+
+def _registry_dir():
+    """(dir, error) for the live-session registry. RESUME_INTERRUPTED_SESSIONS_DIR overrides
+    the default; an override that is SET but unusable is reported on stderr and treated as
+    absent for this run — never a silent fallthrough to the default."""
+    d = os.environ.get("RESUME_INTERRUPTED_SESSIONS_DIR")
+    if d:
+        d = os.path.expanduser(d)
+        if not os.path.isdir(d):
+            return "", ("RESUME_INTERRUPTED_SESSIONS_DIR=%r is not a directory — the "
+                        "live-session registry is treated as absent for this run" % d)
+        return d, ""
+    return os.path.expanduser("~/.claude/sessions"), ""
+
+
+def _registry_ok():
+    d, err = _registry_dir()
+    return (not err) and os.path.isdir(d)
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # the process exists and belongs to someone else
+    except OSError:
+        return False
+
+
+def _ps_start_matches(pid, started_at_ms):
+    """True when the RUNNING process's start matches the record's startedAt (epoch ms).
+
+    Compared via `ps -o etime=` (elapsed time) against now - startedAt, which sidesteps both
+    the timezone frames (a recorded procStart string can sit an hour away from ps's local
+    lstart on a DST boundary) and ps's locale-formatted output. etime is the portable
+    keyword (etimes is Linux-only); its MM:SS / HH:MM:SS / [DD-]HH:MM:SS shapes are parsed
+    defensively. argv is never read. Fails OPEN: when ps has nothing to say, a missing
+    guard must not read a live session as dead — the pid-reuse risk it exists for is
+    narrower than the damage of suppressing a real session."""
+    try:
+        p = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return True
+    out = (p.stdout or "").strip()
+    if p.returncode != 0 or not out:
+        return True
+    try:
+        days = 0
+        rest = out
+        if "-" in out:
+            days, rest = int(out.split("-", 1)[0]), out.split("-", 1)[1]
+        parts = [int(x) for x in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        hh, mm, ss = parts[-3:]
+        elapsed_s = days * 86400 + hh * 3600 + mm * 60 + ss
+    except ValueError:
+        return True
+    started_ms = (time.time() - elapsed_s) * 1000
+    return abs(started_at_ms - started_ms) <= START_MATCH_TOLERANCE_MS
+
+
+def session_live(session_id, registry_dir=None):
+    """True when a registry entry for session_id names a process that is running AND whose
+    start time matches the recorded one — a recycled pid is a DIFFERENT process wearing the
+    same number. Only ever True on positive evidence; any uncertainty answers False."""
+    if not session_id:
+        return False
+    d = registry_dir
+    if d is None:
+        d, err = _registry_dir()
+        if err:
+            if not _registry_warned["done"]:
+                try:
+                    sys.stderr.write("resume-interrupted: %s\n" % err)
+                except Exception:
+                    pass
+                _registry_warned["done"] = True
+            return False
+    try:
+        entries = glob.glob(os.path.join(d, "*.json"))
+    except Exception:
+        return False
+    for path in entries:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except Exception:
+            continue
+        if rec.get("sessionId") != session_id:
+            continue
+        try:
+            pid = int(rec.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not pid or not _pid_alive(pid):
+            continue
+        started = rec.get("startedAt")
+        if isinstance(started, (int, float)) and not _ps_start_matches(pid, float(started)):
+            continue  # the pid was recycled: the recorded session is gone
+        return True
+    return False
+
+
+def _sid_of(path):
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _maybe_running(path, registry_ok):
+    """True when the registry could NOT answer (absent/unreadable) but the transcript was
+    written so recently that the session may still be alive. Such a session is hedged as
+    'may still be running' — never a confident 'never got a reply'."""
+    if registry_ok:
+        return False  # the registry answered; liveness is decided there
+    try:
+        return (time.time() - os.path.getmtime(path)) < MAYBE_RUNNING_S
+    except OSError:
+        return False
 
 
 def _records(path):
@@ -290,7 +424,10 @@ def queued_prompts(recs):
     blocked session; none get a reply. Harvesting only the trailing prompt (what the banner
     quotes) loses the earlier ones. So: find the last assistant turn that did real work
     (non-empty, not an error), then collect every human turn after it, skipping bare
-    availability probes. Order preserved. Returns [] when nothing was queued.
+    availability probes. Queue-operation records are read too: a prompt typed (or absorbed)
+    mid-turn can exist ONLY as such a record and never as a user turn, so a user-role scan
+    alone loses it. Order preserved, user turns deduped against queue records. Returns []
+    when nothing was queued.
     """
     last_work_idx = -1
     for i, o in enumerate(recs):
@@ -300,12 +437,22 @@ def queued_prompts(recs):
             if at and not _is_error_turn(o, at):
                 last_work_idx = i
     out = []
+    seen = set()
     for o in recs[last_work_idx + 1:]:
         m = o.get("message", {})
         if m.get("role") == "user":
             t = _human_text(m)
             if t and not _is_probe_text(t):
                 out.append(t)
+                seen.add(_norm(t)[:60])
+    for o in recs[last_work_idx + 1:]:
+        if o.get("type") != "queue-operation":
+            continue
+        t = _norm(o.get("content") or "")
+        if not t or _is_probe_text(t) or _norm(t)[:60] in seen:
+            continue
+        out.append(t)
+        seen.add(_norm(t)[:60])
     return out
 
 
@@ -347,6 +494,30 @@ _CONTINUATION_STUBS = {
 def _is_continuation_stub(t):
     """True if t is a Claude Code auto-continuation stub rather than genuine human input."""
     return _norm(t).lower().rstrip(".!? ") in _CONTINUATION_STUBS
+
+
+def _unmatched_tool_use(recs):
+    """True if the LAST assistant turn carrying tool_use blocks has an id that no later
+    tool_result record answers — the persisted, structurally-detectable mark of a session
+    killed between emitting a tool call and receiving its result."""
+    last_idx, ids = -1, []
+    for i, o in enumerate(recs):
+        m = o.get("message", {})
+        if m.get("role") == "assistant" and isinstance(m.get("content"), list):
+            block_ids = [b.get("id") for b in m["content"]
+                         if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")]
+            if block_ids:
+                last_idx, ids = i, block_ids
+    if last_idx < 0:
+        return False
+    answered = set()
+    for o in recs[last_idx + 1:]:
+        c = (o.get("message") or {}).get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    answered.add(b.get("tool_use_id"))
+    return any(tid not in answered for tid in ids)
 
 
 def classify(path):
@@ -407,6 +578,14 @@ def classify(path):
         # death was labelled "limit-kill", so a dropped wifi connection told the next session
         # a usage limit had been hit.
         return _res(True, last_prompt or last_human, last_error_kind or "api-error")
+    # (M) MID-TOOL: the last assistant turn emitted tool_use whose result never arrived —
+    # the session died between the call and the tool's completion. Neither (E) (no error
+    # turn: the death beat the API reply) nor (S) (the last real prompt WAS answered: work
+    # was underway). Structural and wording-agnostic. Measured 2026-10-25: a 7-hour
+    # autonomous session died in exactly this shape and matched neither (E) nor (S), so no
+    # automated surface flagged it at all.
+    if _unmatched_tool_use(recs):
+        return _res(True, last_prompt or last_human, "mid-tool")
     if last_human_idx >= 0:
         # "answered" = a GENUINE assistant reply after the last real human turn. A filler reply
         # under a continuation-stub context does NOT count (else the stub masks the real turn's
@@ -543,10 +722,16 @@ def _prior_files(proj, current_sid):
 def _recommended(proj, current_sid):
     """Auto-mode candidate: the most recent SUBSTANTIVE session, iff it was interrupted.
     A clean substantive session (you moved on) suppresses; a killed/empty one is skipped
-    so the offer re-appears. Returns (path, info) or (None, None)."""
+    so the offer re-appears; a LIVE session (registry says its process is running) is never
+    a candidate, and neither is one that may still be running (no registry answered and the
+    transcript is fresh). Returns (path, info) or (None, None)."""
     for f in _prior_files(proj, current_sid):
+        if session_live(_sid_of(f)):
+            continue
         info = classify(f)
         if not info["has_work"]:
+            continue
+        if _maybe_running(f, _registry_ok()):
             continue
         return (f, info) if info["interrupted"] else (None, None)
     return (None, None)
@@ -620,6 +805,8 @@ def _orphaned_queued_notes(proj, current_sid):
     cutoff = time.time() - ORPHANED_NOTE_WINDOW_S
     out = []
     for f in files[:top_idx]:  # newer than the clean top, newest-first
+        if session_live(_sid_of(f)):
+            continue  # a live probe session is not a dead-end retry; its notes may still land
         info = classify(f)
         if info["has_work"]:
             break  # real work happened after the probes -> not this function's to reach past
@@ -660,6 +847,9 @@ def _emit_auto(path, info, others):
     elif info["reason"] == "api-error":
         line = "Last session (%s) was cut off by an API error mid-task." % ts
         req = "Last request: \"%s\"" % d
+    elif info["reason"] == "mid-tool":
+        line = "Last session (%s) died between a tool call and its result mid-task." % ts
+        req = "Last request: \"%s\"" % d
     else:
         line = "Last session (%s) left a request unanswered." % ts
         req = "Unfinished: \"%s\"" % d
@@ -686,6 +876,7 @@ def _emit_auto(path, info, others):
     cause = {"limit-kill": "a usage/limit error",
              "connection-drop": "a lost connection to the API",
              "api-error": "an API error",
+             "mid-tool": "a tool call that never returned its result",
              "stalled": "an unanswered prompt"}.get(info["reason"], "an unanswered prompt or API error")
     ctx = ("resume-interrupted: your most recent substantive session (%s) appears to have been "
            "interrupted mid-task (%s), so no note that "
@@ -886,14 +1077,18 @@ def _collect_rows(proj):
 
     The recommendation is derived from the COMPLETE set, never from a page, so
     paginating can never move or lose the '>' marker."""
+    reg_ok = _registry_ok()
     rows = []
     for f in _prior_files(proj, current_sid=""):
+        if session_live(_sid_of(f)):
+            continue  # a LIVE session is not an interrupted one, whatever its tail
         info = classify(f)
         if info["interrupted"]:
+            info = dict(info, may_be_running=_maybe_running(f, reg_ok))
             rows.append((f, info))
     rec_path = None
     for f, info in rows:  # newest-first: first substantive interrupted is the pick
-        if info["has_work"]:
+        if info["has_work"] and not info.get("may_be_running"):
             rec_path = f
             break
     return rows, rec_path
@@ -911,6 +1106,8 @@ def _render_row(f, info, rec_path):
     # the single trailing quote above (each is a candidate follow-up).
     for q in queued_prompts(_records(f)):
         lines.append("                   · queued: \"%s\"" % (_norm(q)[:90]))
+    if info.get("may_be_running"):
+        lines.append("                   · may still be running (no live-session registry answered)")
     return "\n".join(lines)
 
 
@@ -966,6 +1163,7 @@ def _row_json(f, info, rec_path):
             "work_count": info.get("work_count", 0),
             "reason": info["reason"],
             "is_downtime_note": bool(info.get("is_downtime_note")),
+            "may_be_running": bool(info.get("may_be_running")),
             "dangling": _norm(info["dangling"]),
             "queued": [_norm(q) for q in queued_prompts(_records(f))],
             "recommended": f == rec_path}
