@@ -124,9 +124,14 @@ is exactly where the two can disagree and turn a correct verdict into a wrong on
    `transcript_path` on stdin; sibling files in that same directory are the prior
    sessions. (In Claude Code this is `~/.claude/projects/<encoded-cwd>/`, where
    `<encoded-cwd>` is the working directory with `/` replaced by `-`.)
-2. **Pick the candidate.** Most recent **substantive** session (has real assistant work).
-   If it ended cleanly, there's nothing to resume — the user has moved on. If it matches
-   (E) or (S), it's the one.
+2. **Pick the candidate.** **A session the user names — by id, transcript path, or window
+   title — is an instruction, not a suggestion:** resume THAT session without re-litigating
+   against the newest interrupted one, regardless of its verdict. `not interrupted` is not
+   `nothing to resume`: a clean-verdict session can still hold loose ends that were never
+   addressed (its tail shows them). With several concurrent sessions each told to resume
+   one, each resumes its OWN named target — never all racing to the same latest one.
+   Unnamed, pick the most recent **substantive** session (has real assistant work); if it
+   ended cleanly, the user has moved on; if it matches (E) or (S), it's the one.
    **Shortcut for steps 3–4: `interrupted tail <session-id-or-path>`.** Read-only. It prints the
    detector's verdict, the last conversational records condensed (tool calls and results
    included, errors flagged), every unanswered prompt (`queue-operation` records tagged as
@@ -195,6 +200,7 @@ Useful variants:
 ```
 interrupted recommended                 # just the one most worth resuming
 interrupted --project "$HOME"           # a different project, by its real path
+interrupted --all-projects              # every project folder, rows labelled project + title
 interrupted --limit 10                  # page a long list
 interrupted --json                      # complete machine-readable output
 interrupted --help                      # the full surface
@@ -202,7 +208,9 @@ interrupted --help                      # the full surface
 
 Pass `--project <path>` with the project's **real working directory**; the command does
 Claude Code's transcript-directory encoding itself, so never hand-build a
-`~/.claude/projects/-Users-…` path. (`--dir` still takes an already-encoded directory if
+`~/.claude/projects/-Users-…` path. Sessions launched from a different directory (a project
+or worktree checkout) live in their OWN project folder — from a home launch the plain list
+cannot see them; `--all-projects` does. (`--dir` still takes an already-encoded directory if
 you have one.)
 
 > **Fallback, only if `interrupted: command not found`** — that means the plugin's `bin/`
