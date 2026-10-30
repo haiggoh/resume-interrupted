@@ -131,7 +131,8 @@ is exactly where the two can disagree and turn a correct verdict into a wrong on
    addressed (its tail shows them). With several concurrent sessions each told to resume
    one, each resumes its OWN named target — never all racing to the same latest one.
    Unnamed, pick the most recent **substantive** session (has real assistant work); if it
-   ended cleanly, the user has moved on; if it matches (E) or (S), it's the one.
+   ended cleanly, the user has moved on; if it matches an interrupted verdict — (E), (M), (T)
+   or (S) — it's the one.
    **Shortcut for steps 3–4: `interrupted tail <session-id-or-path>`.** Read-only. It prints the
    detector's verdict, the last conversational records condensed (tool calls and results
    included, errors flagged), every unanswered prompt (`queue-operation` records tagged as

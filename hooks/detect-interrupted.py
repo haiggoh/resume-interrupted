@@ -1003,6 +1003,24 @@ def _all_project_dirs():
     return [os.path.join(root, e) for e in entries if os.path.isdir(os.path.join(root, e))]
 
 
+def _all_projects_mtime_floor():
+    """--all-projects bounds its work to RECENT sessions: classify() parses whole transcripts,
+    so an ancient multi-GB store must not hang the listing (review finding 2026-10-31), and a
+    recovery target is a recent interruption anyway. Default 14 days; 0 disables the bound;
+    set-but-invalid is a loud error (explicit overrides fail loudly)."""
+    raw = os.environ.get("RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S")
+    if raw is None:
+        return time.time() - 14 * 86400
+    try:
+        window = float(raw)
+    except ValueError as err:
+        raise _CliError("RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S must be a number of "
+                        "seconds, not %r" % raw) from err
+    if window < 0:
+        raise _CliError("RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S must be >= 0, not %r" % raw)
+    return time.time() - window if window > 0 else None
+
+
 def _session_title(path):
     """The session's custom window title, from the sidecar <sid>/custom-title.json next to the
     transcript (shape: {"customTitle": "..."}). Missing, corrupt or unreadable -> \"\" — a
@@ -1010,7 +1028,7 @@ def _session_title(path):
     sid = _sid_of(path)
     sidecar = os.path.join(os.path.dirname(path), sid, "custom-title.json")
     try:
-        with open(sidecar) as fh:
+        with open(sidecar, encoding="utf-8", errors="replace") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return ""
@@ -1071,6 +1089,9 @@ Options:
   --all-projects   scan every project folder under ~/.claude/projects (or
                    RESUME_INTERRUPTED_PROJECTS_ROOT), not just this one. Works with
                    list/recommended; each row is labelled with its project folder.
+                   Bounded to the last 14 days of writes (classify parses whole
+                   transcripts; RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S seconds
+                   overrides, 0 disables).
   --json           complete machine-readable output. Never paginated.
   -h, --help       this text.
 
@@ -1084,6 +1105,9 @@ Environment:
   RESUME_INTERRUPTED_PROJECTS_ROOT     projects root for --all-projects (default
                                        ~/.claude/projects). Set but not a directory is an
                                        error for --all-projects, never a silent fallback.
+  RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S
+                                       --all-projects recency window in seconds (default
+                                       1209600 = 14 days; 0 disables). Invalid is an error.
 
 Read-only: no transcript and no recovery state is ever modified.
 """ % (TAIL_RECORDS_DEFAULT, TAIL_CHARS_DEFAULT, CLI_MAX_CHARS_DEFAULT)
@@ -1173,17 +1197,24 @@ def _resolve_project_dir(opts):
     return _project_dir_from_cwd()
 
 
-def _collect_rows(proj, all_projects=False):
+def _collect_rows(proj, all_projects=False, mtime_floor=None):
     """All interrupted sessions newest-first, plus the recommended one.
 
     The recommendation is derived from the COMPLETE set, never from a page, so
     paginating can never move or lose the '>' marker. all_projects=True scans every
     project directory under the projects root (depth-1 per directory: subagent
-    transcripts live in a per-session subagents/ subdir and are never seen)."""
+    transcripts live in a per-session subagents/ subdir and are never seen — and an
+    explicit guard keeps out one symlinked to project level). mtime_floor bounds the
+    cross-project scan to recent transcripts (classify parses whole files)."""
     reg_ok = _registry_ok()
     rows = []
     for pdir in (_all_project_dirs() if all_projects else [proj]):
         for f in _prior_files(pdir, current_sid=""):
+            if all_projects and "subagents" in os.path.realpath(f).split(os.sep):
+                continue  # defense in depth: a subagent transcript, including one whose
+            # SYMLINK sits at project level (the link path itself names no subagents part)
+            if mtime_floor and os.path.getmtime(f) < mtime_floor:
+                continue  # outside the recency window — not a recovery target
             if session_live(_sid_of(f)):
                 continue  # a LIVE session is not an interrupted one, whatever its tail
             info = classify(f)
@@ -1566,7 +1597,12 @@ def _cli(argv):
             sys.stderr.write("interrupted: RESUME_INTERRUPTED_PROJECTS_ROOT is set but %r is "
                              "not a directory\n" % root)
             return 2
-        rows, rec_path = _collect_rows(None, all_projects=True)
+        try:
+            mtime_floor = _all_projects_mtime_floor()
+        except _CliError as e:
+            sys.stderr.write("interrupted: %s\n" % e)
+            return 2
+        rows, rec_path = _collect_rows(None, all_projects=True, mtime_floor=mtime_floor)
         proj = root
     else:
         proj = _resolve_project_dir(opts)
@@ -1588,7 +1624,9 @@ def _cli(argv):
         elif rec:
             print(_render_row(rec[0][0], rec[0][1], rec_path))
         else:
-            print("No interrupted session with substantive work in this project.")
+            print("No interrupted session with substantive work across all project folders."
+                  if all_projects
+                  else "No interrupted session with substantive work in this project.")
         return 0
 
     if opts["json"]:

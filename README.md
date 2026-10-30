@@ -20,7 +20,9 @@ cracks. This plugin recovers it from the transcript.
   *every* unresumed session — most recent first, recommendation marked — so you can jump
   back into any of them, not just the last. `interrupted --all-projects` scans every
   project folder (sessions launched from project or worktree checkouts are invisible to
-  the plain list from a home launch), labelling each row with its project and window title.
+  the plain list from a home launch), labelling each row with its project and window title;
+  the scan is bounded to the last 14 days of writes
+  (`RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S` overrides, `0` disables).
 - **Tail mode:** `interrupted tail <session-id-or-path>` condenses one transcript's end —
   last records, every unanswered prompt (including `queue-operation` ones), unanswered tool
   calls, the verdict and a reset-boundary check. If the optional **audit-loose-ends** plugin

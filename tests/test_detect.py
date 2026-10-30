@@ -1191,5 +1191,73 @@ with open(tj, "w") as fh:
 check(detect._session_title(p) == "", "a corrupt sidecar degrades to an empty title")
 check(detect._session_title("/nonexistent/x.jsonl") == "", "a nonexistent transcript degrades to an empty title")
 
+print("== v0.8.0 review fixes: guards, bounds, scopes ==")
+os.environ["RESUME_INTERRUPTED_PROJECTS_ROOT"] = ROOT
+try:
+    # A subagent transcript SYMLINKED to project level must be excluded — the depth-1 glob
+    # alone does not see through a symlink placed at the project level (review finding).
+    os.symlink(os.path.join(pB, "sidX", "subagents", "sub.jsonl"), os.path.join(pA, "flat-sub.jsonl"))
+    out6j, _, _ = launch(["list", "--all-projects", "--json"])
+    paths6 = [it["path"] for it in json.loads(out6j)["items"]]
+    check(not any(en.endswith("flat-sub.jsonl") for en in paths6),
+          "a subagent transcript symlinked to project level is excluded")
+    # The cross-project scan is bounded by a recency window: classify() parses whole
+    # transcripts, so an ancient store must not make --all-projects hang (review finding).
+    ancient = os.path.join(pB, "old.jsonl")
+    with open(ancient, "w") as fh:
+        for r in WORK:
+            fh.write(json.dumps(r) + "\n")
+    old40 = time.time() - 40 * 24 * HOUR
+    os.utime(ancient, (old40, old40))
+    out7j, _, rc7 = launch(["list", "--all-projects", "--json"])
+    paths7 = [it["path"] for it in json.loads(out7j)["items"]]
+    check(rc7 == 0 and not any(en.endswith("old.jsonl") for en in paths7),
+          "a transcript older than the recency window is skipped cross-project")
+    check(any(en.endswith("/a.jsonl") for en in paths7), "recent sessions are still listed")
+    WSAVE = os.environ.get("RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S")
+    try:
+        os.environ["RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S"] = "0"
+        out8j, _, _ = launch(["list", "--all-projects", "--json"])
+        paths8 = [it["path"] for it in json.loads(out8j)["items"]]
+        check(any(en.endswith("old.jsonl") for en in paths8),
+              "window 0 disables the bound (the ancient transcript returns)")
+        os.environ["RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S"] = "bogus"
+        outB, errB, rcB = launch(["list", "--all-projects"])
+        check(rcB != 0 and "RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S" in (outB + errB),
+              "an invalid window override aborts loudly, naming the variable")
+    finally:
+        if WSAVE is None:
+            os.environ.pop("RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S", None)
+        else:
+            os.environ["RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S"] = WSAVE
+    # recommended's no-pick message names its scope under --all-projects (review finding).
+    ROOT2 = tempfile.mkdtemp()
+    os.environ["RESUME_INTERRUPTED_PROJECTS_ROOT"] = ROOT2
+    pC = os.path.join(ROOT2, "-Users-me-projC")
+    os.makedirs(pC)
+    fC = os.path.join(pC, "c.jsonl")
+    with open(fC, "w") as fh:
+        for r in CLEAN:
+            fh.write(json.dumps(r) + "\n")
+    os.utime(fC, (time.time() - HOUR, time.time() - HOUR))
+    out9, _, rc9 = launch(["recommended", "--all-projects"])
+    check(rc9 == 0 and "all project folders" in out9,
+          "recommended --all-projects with no pick names its scope")
+finally:
+    if ROOT_SAVE is None:
+        os.environ.pop("RESUME_INTERRUPTED_PROJECTS_ROOT", None)
+    else:
+        os.environ["RESUME_INTERRUPTED_PROJECTS_ROOT"] = ROOT_SAVE
+
+# A title holding bytes invalid in the platform default encoding still surfaces — utf-8 with
+# errors=replace, not a silent loss (review finding: LANG=C lost emoji titles to ValueError).
+p = session([U("hi"), A("ho")])
+os.makedirs(os.path.join(os.path.dirname(p), "s"), exist_ok=True)
+tj = os.path.join(os.path.dirname(p), "s", "custom-title.json")
+with open(tj, "wb") as fh:
+    fh.write(b'{"customTitle": "bad \xff\xfe bytes"}')
+t = detect._session_title(p)
+check(t != "" and "bad" in t, "a title with invalid-utf8 bytes still surfaces (replacement, not loss)")
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

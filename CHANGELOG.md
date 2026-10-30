@@ -28,7 +28,11 @@ Three detection gaps closed, all measured on real interrupted sessions.
   root instead of only the launch dir's — sessions run in project or worktree checkouts
   were invisible from a home launch. Rows (and JSON) carry the project folder and the
   session's custom window title (sidecar `custom-title.json`; missing/corrupt degrades to
-  empty). Subagent transcripts never enter the listing. Scan approach borrowed from
+  empty, read as utf-8 with replacement so a non-UTF-8 locale never loses a title).
+  Subagent transcripts never enter the listing — depth-1 scan plus an explicit guard for
+  one symlinked to project level. The scan is bounded to the last 14 days of writes
+  (`RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S` seconds overrides, `0` disables, invalid is
+  a loud error) so an ancient multi-GB store cannot hang it. Scan approach borrowed from
   cc-transcript's cross-project session discovery.
 - `RESUME_INTERRUPTED_PROJECTS_ROOT` overrides the projects root (tests, unusual installs);
   set but not a directory is an error for `--all-projects`, never a silent fallback.
