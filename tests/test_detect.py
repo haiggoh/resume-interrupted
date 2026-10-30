@@ -1119,5 +1119,77 @@ out, _, code = tail_with_env(["tail", tp], {"RESUME_INTERRUPTED_AUDIT_SCAN": bad
 check(code == 0 and "step one done" in out and "audit" in out.lower() and "3" in out,
       "a failing scanner is reported in the audit section; the tail itself still succeeds")
 
+print("== v0.8.0: --all-projects — sessions from every project folder ==")
+ROOT_SAVE = os.environ.get("RESUME_INTERRUPTED_PROJECTS_ROOT")
+ROOT = tempfile.mkdtemp()
+os.environ["RESUME_INTERRUPTED_PROJECTS_ROOT"] = ROOT
+try:
+    pA = os.path.join(ROOT, "-Users-me-projA")
+    os.makedirs(pA)
+    pB = os.path.join(ROOT, "-Users-me-projB")
+    os.makedirs(pB)
+    old = time.time() - 2 * HOUR
+    fA = os.path.join(pA, "a.jsonl")
+    with open(fA, "w") as fh:
+        for r in WORK:
+            fh.write(json.dumps(r) + "\n")
+    os.utime(fA, (old, old))
+    fB = os.path.join(pB, "b.jsonl")
+    with open(fB, "w") as fh:
+        for r in PROBE:
+            fh.write(json.dumps(r) + "\n")
+    os.utime(fB, (old, old))
+    out, _, rc = launch(["list", "--all-projects"])
+    check(rc == 0 and "-Users-me-projA" in out and "-Users-me-projB" in out,
+          "--all-projects lists sessions from BOTH project dirs, each labelled with its project")
+    check("RECOMMENDED" in out, "the recommendation still marks the substantive session across projects")
+    out2, _, _ = launch(["list", "--dir", pA])
+    check("-Users-me-projB" not in out2, "without the flag, other projects stay invisible")
+    # Subagent transcripts never enter the listing (depth-1 scan; explicit guard as defense).
+    sub = os.path.join(pB, "sidX", "subagents")
+    os.makedirs(sub)
+    with open(os.path.join(sub, "sub.jsonl"), "w") as fh:
+        for r in WORK:
+            fh.write(json.dumps(r) + "\n")
+    out3, _, _ = launch(["list", "--all-projects"])
+    check("sub.jsonl" not in out3, "a subagent transcript is not listed as a session")
+    # A LIVE session is excluded, whatever its tail ("sid-live" is registered live by the v0.6 block).
+    fLive = os.path.join(pB, "sid-live.jsonl")
+    with open(fLive, "w") as fh:
+        for r in WORK:
+            fh.write(json.dumps(r) + "\n")
+    os.utime(fLive, (old, old))
+    out4, _, _ = launch(["list", "--all-projects"])
+    check("sid-live" not in out4, "a live session (registry + alive pid) is not listed cross-project")
+    # A corrupt sidecar title must not break the listing.
+    os.makedirs(os.path.join(pA, "a"))
+    with open(os.path.join(pA, "a", "custom-title.json"), "w") as fh:
+        fh.write("{not json")
+    out5, _, rc5 = launch(["list", "--all-projects"])
+    check(rc5 == 0 and "-Users-me-projA" in out5, "a corrupt custom-title.json never breaks the listing")
+    # An invalid override fails loudly, naming the variable (never a silent fallback).
+    os.environ["RESUME_INTERRUPTED_PROJECTS_ROOT"] = os.path.join(ROOT, "nope")
+    outE, errE, rcE = launch(["list", "--all-projects"])
+    check(rcE != 0 and "RESUME_INTERRUPTED_PROJECTS_ROOT" in (outE + errE),
+          "an invalid projects-root override aborts loudly, naming the variable")
+finally:
+    if ROOT_SAVE is None:
+        os.environ.pop("RESUME_INTERRUPTED_PROJECTS_ROOT", None)
+    else:
+        os.environ["RESUME_INTERRUPTED_PROJECTS_ROOT"] = ROOT_SAVE
+
+print("== v0.8.0: session titles from the custom-title sidecar ==")
+p = session([U("hi"), A("ho")])
+check(detect._session_title(p) == "", "no sidecar -> empty title, never an error")
+os.makedirs(os.path.join(os.path.dirname(p), "s"))
+tj = os.path.join(os.path.dirname(p), "s", "custom-title.json")
+with open(tj, "w") as fh:
+    json.dump({"customTitle": "📡 something"}, fh)
+check(detect._session_title(p) == "📡 something", "the custom title is read from the sidecar")
+with open(tj, "w") as fh:
+    fh.write("{corrupt")
+check(detect._session_title(p) == "", "a corrupt sidecar degrades to an empty title")
+check(detect._session_title("/nonexistent/x.jsonl") == "", "a nonexistent transcript degrades to an empty title")
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

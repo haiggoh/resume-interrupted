@@ -983,11 +983,41 @@ def _encode_project_path(path):
 
 
 def _projects_root():
-    return os.path.expanduser("~/.claude/projects")
+    # RESUME_INTERRUPTED_PROJECTS_ROOT overrides the projects root (tests; unusual installs).
+    # Returned as-is: the CLI validates it loudly where it CONSUMES it (--all-projects), while
+    # the hook path stays fail-open (a bad override must not fail every session's startup).
+    return os.environ.get("RESUME_INTERRUPTED_PROJECTS_ROOT") or os.path.expanduser("~/.claude/projects")
 
 
 def _project_dir_from_cwd():
     return os.path.join(_projects_root(), _encode_project_path(os.getcwd()))
+
+
+def _all_project_dirs():
+    """Every project transcript directory under the projects root, for --all-projects."""
+    root = _projects_root()
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return []
+    return [os.path.join(root, e) for e in entries if os.path.isdir(os.path.join(root, e))]
+
+
+def _session_title(path):
+    """The session's custom window title, from the sidecar <sid>/custom-title.json next to the
+    transcript (shape: {"customTitle": "..."}). Missing, corrupt or unreadable -> \"\" — a
+    title is decoration, never fatal."""
+    sid = _sid_of(path)
+    sidecar = os.path.join(os.path.dirname(path), sid, "custom-title.json")
+    try:
+        with open(sidecar) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    title = data.get("customTitle")
+    return title if isinstance(title, str) else ""
 
 
 # ----------------------------------------------------------------------------
@@ -1038,6 +1068,9 @@ Options:
                    0 disables the character budget.
   --all            no item and no character limit. For an ordinary terminal or a
                    redirection; may exceed what Claude Code shows inline.
+  --all-projects   scan every project folder under ~/.claude/projects (or
+                   RESUME_INTERRUPTED_PROJECTS_ROOT), not just this one. Works with
+                   list/recommended; each row is labelled with its project folder.
   --json           complete machine-readable output. Never paginated.
   -h, --help       this text.
 
@@ -1048,6 +1081,9 @@ Environment:
   RESUME_INTERRUPTED_PLUGINS_DIR       plugins directory searched for audit-loose-ends
                                        (default ~/.claude/plugins).
   RESUME_INTERRUPTED_SESSIONS_DIR      live-session registry (default ~/.claude/sessions).
+  RESUME_INTERRUPTED_PROJECTS_ROOT     projects root for --all-projects (default
+                                       ~/.claude/projects). Set but not a directory is an
+                                       error for --all-projects, never a silent fallback.
 
 Read-only: no transcript and no recovery state is ever modified.
 """ % (TAIL_RECORDS_DEFAULT, TAIL_CHARS_DEFAULT, CLI_MAX_CHARS_DEFAULT)
@@ -1058,6 +1094,7 @@ Read-only: no transcript and no recovery state is ever modified.
 FOOTER_RESERVE = 120
 
 LIST_HEADER = "Interrupted sessions in this project (most recent first):\n"
+LIST_HEADER_CROSS = "Interrupted sessions across ALL project folders (most recent first):\n"
 
 LIST_TRAILER = (
     "\n  '>' = most likely the one to resume (most recent session with real work).\n"
@@ -1076,6 +1113,7 @@ def _parse_cli(argv):
     args = list(argv[1:])
     opts = {"cmd": None, "project": None, "dir": None, "limit": 0, "page": 1,
             "max_chars": CLI_MAX_CHARS_DEFAULT, "json": False, "all": False,
+            "all_projects": False,
             "target": None, "records": TAIL_RECORDS_DEFAULT, "chars": TAIL_CHARS_DEFAULT,
             "no_audit": False}
     if args and args[0] in ("list", "recommended", "tail", "help"):
@@ -1113,10 +1151,14 @@ def _parse_cli(argv):
             opts["all"] = True
             opts["limit"] = 0
             opts["max_chars"] = 0
+        elif a == "--all-projects":
+            opts["all_projects"] = True
         elif a in ("-h", "--help"):
             opts["cmd"] = "help"
         else:
             raise _CliError("unknown argument %s (try: interrupted --help)" % a)
+    if opts["all_projects"] and (opts["project"] or opts["dir"]):
+        raise _CliError("--all-projects scans every project folder; --project/--dir pick ONE")
     if opts["cmd"] is None:
         opts["cmd"] = "list"
     return opts
@@ -1131,20 +1173,28 @@ def _resolve_project_dir(opts):
     return _project_dir_from_cwd()
 
 
-def _collect_rows(proj):
+def _collect_rows(proj, all_projects=False):
     """All interrupted sessions newest-first, plus the recommended one.
 
     The recommendation is derived from the COMPLETE set, never from a page, so
-    paginating can never move or lose the '>' marker."""
+    paginating can never move or lose the '>' marker. all_projects=True scans every
+    project directory under the projects root (depth-1 per directory: subagent
+    transcripts live in a per-session subagents/ subdir and are never seen)."""
     reg_ok = _registry_ok()
     rows = []
-    for f in _prior_files(proj, current_sid=""):
-        if session_live(_sid_of(f)):
-            continue  # a LIVE session is not an interrupted one, whatever its tail
-        info = classify(f)
-        if info["interrupted"]:
-            info = dict(info, may_be_running=_maybe_running(f, reg_ok))
-            rows.append((f, info))
+    for pdir in (_all_project_dirs() if all_projects else [proj]):
+        for f in _prior_files(pdir, current_sid=""):
+            if session_live(_sid_of(f)):
+                continue  # a LIVE session is not an interrupted one, whatever its tail
+            info = classify(f)
+            if info["interrupted"]:
+                extra = {"may_be_running": _maybe_running(f, reg_ok)}
+                if all_projects:
+                    extra["project"] = os.path.basename(pdir)
+                    extra["title"] = _session_title(f)
+                info = dict(info, **extra)
+                rows.append((f, info))
+    rows.sort(key=lambda fi: os.path.getmtime(fi[0]), reverse=True)
     rec_path = None
     for f, info in rows:  # newest-first: first substantive interrupted is the pick
         if info["has_work"] and not info.get("may_be_running"):
@@ -1167,6 +1217,10 @@ def _render_row(f, info, rec_path):
         lines.append("                   · queued: \"%s\"" % (_norm(q)[:90]))
     if info.get("may_be_running"):
         lines.append("                   · may still be running (no live-session registry answered)")
+    if info.get("project"):
+        title = info.get("title") or ""
+        lines.append("                   · project %s%s" % (
+            info["project"], (" — \"%s\"" % _norm(title)[:70]) if title else ""))
     return "\n".join(lines)
 
 
@@ -1202,6 +1256,8 @@ def _paginate(blocks, limit, max_chars, page):
 def _next_page_cmd(opts, page):
     """The exact command that shows the next page, echoing the options in force."""
     parts = ["interrupted", "list"]
+    if opts.get("all_projects"):
+        parts.append("--all-projects")
     if opts.get("project"):
         parts.append("--project %s" % opts["project"])
     if opts.get("dir"):
@@ -1223,6 +1279,8 @@ def _row_json(f, info, rec_path):
             "reason": info["reason"],
             "is_downtime_note": bool(info.get("is_downtime_note")),
             "may_be_running": bool(info.get("may_be_running")),
+            "project": info.get("project"),
+            "title": info.get("title") or "",
             "dangling": _norm(info["dangling"]),
             "queued": [_norm(q) for q in queued_prompts(_records(f))],
             "recommended": f == rec_path}
@@ -1501,16 +1559,25 @@ def _cli(argv):
             sys.stderr.write("interrupted: %s\n" % e)
             return 2
 
-    proj = _resolve_project_dir(opts)
-    if not os.path.isdir(proj):
-        if opts["json"]:
-            print(json.dumps({"project_dir": proj, "total": 0, "items": [],
-                              "error": "no such project transcript directory"}))
-        else:
-            print("No project transcript directory found (%s)." % proj)
-        return 0
-
-    rows, rec_path = _collect_rows(proj)
+    all_projects = opts["all_projects"]
+    if all_projects:
+        root = _projects_root()
+        if os.environ.get("RESUME_INTERRUPTED_PROJECTS_ROOT") and not os.path.isdir(root):
+            sys.stderr.write("interrupted: RESUME_INTERRUPTED_PROJECTS_ROOT is set but %r is "
+                             "not a directory\n" % root)
+            return 2
+        rows, rec_path = _collect_rows(None, all_projects=True)
+        proj = root
+    else:
+        proj = _resolve_project_dir(opts)
+        if not os.path.isdir(proj):
+            if opts["json"]:
+                print(json.dumps({"project_dir": proj, "total": 0, "items": [],
+                                  "error": "no such project transcript directory"}))
+            else:
+                print("No project transcript directory found (%s)." % proj)
+            return 0
+        rows, rec_path = _collect_rows(proj)
 
     if opts["cmd"] == "recommended":
         rec = [(f, i) for f, i in rows if f == rec_path]
@@ -1531,7 +1598,8 @@ def _cli(argv):
         return 0
 
     if not rows:
-        print("No interrupted sessions found in this project.")
+        print("No interrupted sessions found across all project folders." if all_projects
+              else "No interrupted sessions found in this project.")
         return 0
 
     blocks = [_render_row(f, i, rec_path) for f, i in rows]
@@ -1540,13 +1608,14 @@ def _cli(argv):
     # over the edge.
     budget = opts["max_chars"]
     if budget:
-        budget = max(1, budget - (len(LIST_HEADER) + len(LIST_TRAILER) + FOOTER_RESERVE))
+        budget = max(1, budget - (len(LIST_HEADER_CROSS if all_projects else LIST_HEADER)
+                                  + len(LIST_TRAILER) + FOOTER_RESERVE))
     shown, start, has_more = _paginate(blocks, opts["limit"], budget, opts["page"])
     if not shown:
         print("Page %d is past the end (%d session(s) total)." % (opts["page"], len(rows)))
         return 0
 
-    parts = [LIST_HEADER]
+    parts = [LIST_HEADER_CROSS if all_projects else LIST_HEADER]
     parts.extend(shown)
     if start or has_more:
         parts.append("\n  Showing %d-%d of %d." % (start + 1, start + len(shown), len(rows)))
