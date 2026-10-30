@@ -12,6 +12,28 @@ which is usually the previous release. Release dates are the date of the commit 
 `.claude-plugin/plugin.json` to that version. Entries therefore summarise recorded commits rather
 than reproducing notes written at release time.
 
+## [0.7.0] - 2026-10-30
+
+### Added
+- `interrupted tail <session-id-or-path>`: a read-only transcript tail parser. It prints the
+  detector's verdict, the last `--records N` conversational records condensed (tool calls and
+  results, errors flagged), every unanswered prompt with `queue-operation` records tagged as
+  such, any unanswered `tool_use`, and a reset-boundary check. `--json` gives the same as one
+  object; `--chars N` clips each record. Replaces the inline python every recovery used to
+  hand-roll.
+- Soft dependency on audit-loose-ends: when it is installed, `tail` appends its `audit-scan.py`
+  digest of the resumed session, run on the explicit transcript path (never `--last`, which
+  ranks by mtime). Resolved from `RESUME_INTERRUPTED_AUDIT_SCAN` (set but unusable is an
+  error), then `installed_plugins.json`, then the highest NUMERIC cache version. Absent means
+  silently skipped; a crashing scanner is reported inside the digest section and never fails the
+  tail. `--no-audit` opts out. `RESUME_INTERRUPTED_PLUGINS_DIR` relocates the search.
+
+### Changed
+- SKILL.md documents the precedence (E) > (M) > (S) and that a mid-tool or stalled death can
+  still be a quota kill when the kill left no error turn; the reset-boundary check is offered
+  for every interrupted session by `tail`, labelled with when it applies. Detector logic is
+  unchanged: the precedence is now pinned by tests.
+
 ## [0.6.0] - 2026-10-26
 
 - **A live session is never offered as a resume candidate** (batch F). The launcher's

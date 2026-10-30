@@ -58,6 +58,13 @@ A session was interrupted (rather than ended intentionally) if **either**:
   underway). Structural and wording-agnostic: a persisted `tool_use` id with no matching
   `tool_result` anywhere after it.
 
+**Precedence is (E) > (M) > (S).** The kinds are not exclusive in reality — a budget kill can
+land while a tool call is in flight — so when a persisted error turn exists it wins over an
+unanswered `tool_use`, and the session is treated as an (E) death. When the kill beat the API
+reply and left **no** error turn, the transcript cannot say why it died: (M) and (S) name the
+shape, not the cause. Do not read "mid-tool" as "not a budget kill"; if the user or a ledger says
+it was one, apply the reset-boundary check below by hand (`interrupted tail` prints it).
+
 Distinguish real interrupted work from a bare **availability probe** ("are we back yet?"):
 a resumable session has **≥1 real assistant turn** before the interruption. A session that
 is *only* an unanswered prompt has nothing to resume — skip it and look at the next.
@@ -120,6 +127,13 @@ is exactly where the two can disagree and turn a correct verdict into a wrong on
 2. **Pick the candidate.** Most recent **substantive** session (has real assistant work).
    If it ended cleanly, there's nothing to resume — the user has moved on. If it matches
    (E) or (S), it's the one.
+   **Shortcut for steps 3–4: `interrupted tail <session-id-or-path>`.** Read-only. It prints the
+   detector's verdict, the last conversational records condensed (tool calls and results
+   included, errors flagged), every unanswered prompt (`queue-operation` records tagged as
+   such), any unanswered `tool_use`, the reset-boundary check, and — when the audit-loose-ends
+   plugin is installed — its digest of what that session changed (silently skipped when it is
+   not). Widen with `--records N`; `--no-audit` skips the digest; `--json` for a parseable form.
+   You still read back past what it shows before summarising to the user.
 3. **Anchor to the end, then walk backward — don't just read a fixed tail.** A fixed
    line count can open *below* the turn that matters and miss it. Instead find the **last
    real message turn** (skip `last-prompt`, `system`, and `attachment` artifacts) and read

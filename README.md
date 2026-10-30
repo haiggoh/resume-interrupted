@@ -19,6 +19,11 @@ cracks. This plugin recovers it from the transcript.
 - **Browse mode:** run `interrupted` (or ask Claude to "list interrupted sessions") to see
   *every* unresumed session — most recent first, recommendation marked — so you can jump
   back into any of them, not just the last.
+- **Tail mode:** `interrupted tail <session-id-or-path>` condenses one transcript's end —
+  last records, every unanswered prompt (including `queue-operation` ones), unanswered tool
+  calls, the verdict and a reset-boundary check. If the optional **audit-loose-ends** plugin
+  is installed it also appends its digest of what that session changed; without it, that part
+  is silently skipped. Read-only.
 
 ### Re-offering vs. nagging
 

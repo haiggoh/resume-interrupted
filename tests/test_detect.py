@@ -956,5 +956,140 @@ check(not c["interrupted"] and c["reason"] != "mid-tool",
       "mutation: without the mid-tool check the shape reads as clean (mechanism proven)")
 os.environ["RESUME_INTERRUPTED_SESSIONS_DIR"] = REG
 
+print("== v0.7.0: `interrupted tail` -- the read-only transcript tail parser ==")
+TOOL_BAD = {"type": "user", "message": {"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": "tu1", "is_error": True, "content": "boom: exit 2"}]}}
+TAIL_RECS = [U("build the thing"), A("starting on it"), TOOL, TOOL_RESULT, A("step one done"),
+             QOP, U("and also check the docs"), LP("and also check the docs")]
+tp = session(TAIL_RECS)
+before = open(tp, "rb").read()
+out, err, code = launch(["tail", tp])
+check(code == 0, "tail exits 0 on a readable transcript (stderr: %s)" % err.strip()[:80])
+check("starting on it" in out and "step one done" in out, "tail shows the assistant text turns")
+check("tool_use Bash" in out and "tool_result" in out, "tail condenses tool calls and their results")
+check("and also check the docs" in out, "tail shows the unanswered user turn")
+check("queue-operation" in out and "C0 amendment" in out,
+      "tail harvests the queue-operation record and says it never became a user turn")
+check(open(tp, "rb").read() == before, "tail is read-only: the transcript is byte-identical")
+
+out, _, _ = launch(["tail", tp, "--records", "2"])
+check("starting on it" not in out and "and also check the docs" in out,
+      "--records N limits the condensed tail to the last N conversational records")
+
+out, _, _ = launch(["tail", session([U("go"), A("working"), TOOL_BAD]), "--no-audit"])
+check("ERROR" in out and "boom: exit 2" in out, "an errored tool_result is flagged as an error, with its text")
+
+mt = session([U("go"), A("working"), TOOL])
+out, _, _ = launch(["tail", mt, "--no-audit"])
+check("tu1" in out and "unanswered tool_use" in out.lower(),
+      "a tool_use with no result is listed as unanswered by id and name")
+check("mid-tool" in out, "tail states the detector's classification for the session")
+check("reset" in out.lower() and "quota" in out.lower(),
+      "even a non-(E) death gets the reset-boundary check, labelled as relevant only for a quota kill")
+
+out, _, _ = launch(["tail", mt, "--json", "--no-audit"])
+try:
+    tj = json.loads(out)
+except Exception:
+    tj = {}
+check(tj.get("reason") == "mid-tool" and tj.get("unanswered_tool_use") and "records" in tj,
+      "--json is one parseable object with reason, unanswered_tool_use and records")
+
+_, err, code = launch(["tail"])
+check(code == 2 and "tail" in err, "tail with no target is a loud usage error, exit 2")
+_, err, code = launch(["tail", tp, "--bogus"])
+check(code == 2 and "--bogus" in err, "an unknown tail flag is a loud error, exit 2")
+_, err, code = launch(["tail", os.path.join(tempfile.mkdtemp(), "nope.jsonl")])
+check(code != 0 and "nope.jsonl" in err, "a missing transcript fails loudly and names it")
+out, _, _ = launch(["--help"])
+check("tail" in out and "--records" in out, "--help documents the tail subcommand and its flags")
+
+# A session id resolves inside the project dir without a full path.
+pd = proj_with([("abc12345-aaaa.jsonl", TAIL_RECS, None)])
+out, _, code = launch(["tail", "abc12345", "--dir", pd, "--no-audit"])
+check(code == 0 and "step one done" in out, "tail resolves a session-id prefix inside --dir")
+
+print("== v0.7.0: precedence -- an error turn outranks an unmatched tool_use ==")
+c = detect.classify(session([U("go"), A("working"), TOOL, AERR(BUDGET)]))
+check(c["reason"] == "limit-kill",
+      "(E) outranks (M) when the error turn IS persisted (pins the documented precedence)")
+c = detect.classify(session([U("go"), A("working"), TOOL, AERR("API Error: Connection error."),
+                             LP("go")]))
+check(c["reason"] != "mid-tool", "a connection-drop error after the tool_use is never relabelled mid-tool")
+
+print("== v0.7.0: soft dependency on audit-loose-ends ==")
+FAKE_AUDIT = ("#!/usr/bin/env python3\nimport sys\n"
+              "print('FAKE-AUDIT-DIGEST args=' + ' '.join(sys.argv[1:]))\n")
+
+
+def fake_plugin(root, version):
+    """A cache dir for audit-loose-ends at `version` under root, with a fake scanner."""
+    sd = os.path.join(root, "cache", "mkt", "audit-loose-ends", version, "scripts")
+    os.makedirs(sd)
+    with open(os.path.join(sd, "audit-scan.py"), "w") as fh:
+        fh.write(FAKE_AUDIT.replace("FAKE-AUDIT-DIGEST", "FAKE-AUDIT-DIGEST v%s" % version))
+    return os.path.dirname(sd)
+
+
+def tail_env(extra):
+    e = {k: v for k, v in os.environ.items() if not k.startswith("RESUME_INTERRUPTED_AUDIT")}
+    e.update(extra)
+    return e
+
+
+def tail_with_env(args, extra):
+    r = subprocess.run([LAUNCHER] + args, capture_output=True, text=True, env=tail_env(extra))
+    return r.stdout, r.stderr, r.returncode
+
+
+# Absent: nothing installed -> a SILENT skip, never an error, never a section.
+empty_root = tempfile.mkdtemp()
+out, err, code = tail_with_env(["tail", tp], {"RESUME_INTERRUPTED_PLUGINS_DIR": empty_root})
+check(code == 0 and "FAKE-AUDIT" not in out and "audit" not in err.lower(),
+      "audit-loose-ends absent: tail skips the audit silently (exit 0, no error)")
+
+# Present via the cache: the HIGHEST numeric version wins (0.13.1 beats 0.9.0 -- lexically it would not).
+root = tempfile.mkdtemp()
+for _v in ("0.9.0", "0.13.1", "0.10.0"):
+    fake_plugin(root, _v)
+out, _, code = tail_with_env(["tail", tp], {"RESUME_INTERRUPTED_PLUGINS_DIR": root})
+check(code == 0 and "FAKE-AUDIT-DIGEST v0.13.1" in out,
+      "audit-loose-ends present: its scanner runs, the highest NUMERIC cache version wins")
+check(("args=%s" % tp) in out,
+      "the scanner is given the explicit transcript PATH, never --last (the mtime trap)")
+
+# Present via the registry: installPath is preferred over the cache sort.
+root2 = tempfile.mkdtemp()
+fake_plugin(root2, "0.13.1")
+pinned = fake_plugin(root2, "0.5.0")
+with open(os.path.join(root2, "installed_plugins.json"), "w") as fh:
+    json.dump({"version": 2, "plugins": {"audit-loose-ends@mkt": [{"installPath": pinned}]}}, fh)
+out, _, _ = tail_with_env(["tail", tp], {"RESUME_INTERRUPTED_PLUGINS_DIR": root2})
+check("FAKE-AUDIT-DIGEST v0.5.0" in out,
+      "the registry's installPath outranks the highest cache dir")
+
+out, _, _ = tail_with_env(["tail", tp, "--no-audit"], {"RESUME_INTERRUPTED_PLUGINS_DIR": root})
+check("FAKE-AUDIT" not in out, "--no-audit suppresses the audit section")
+
+# An explicit override that is SET but unusable must fail loudly, not fall through.
+_, err, code = tail_with_env(["tail", tp], {"RESUME_INTERRUPTED_AUDIT_SCAN": "/no/such/audit-scan.py",
+                                            "RESUME_INTERRUPTED_PLUGINS_DIR": root})
+check(code != 0 and "RESUME_INTERRUPTED_AUDIT_SCAN" in err,
+      "RESUME_INTERRUPTED_AUDIT_SCAN set but missing aborts and names the variable")
+override = os.path.join(tempfile.mkdtemp(), "audit-scan.py")
+with open(override, "w") as fh:
+    fh.write(FAKE_AUDIT.replace("FAKE-AUDIT-DIGEST", "FAKE-AUDIT-DIGEST override"))
+out, _, code = tail_with_env(["tail", tp], {"RESUME_INTERRUPTED_AUDIT_SCAN": override,
+                                             "RESUME_INTERRUPTED_PLUGINS_DIR": root})
+check(code == 0 and "FAKE-AUDIT-DIGEST override" in out, "a valid override wins over discovery")
+
+# A scanner that crashes must not take the tail down with it.
+bad = os.path.join(tempfile.mkdtemp(), "audit-scan.py")
+with open(bad, "w") as fh:
+    fh.write("#!/usr/bin/env python3\nimport sys\nsys.stderr.write('kaboom\\n')\nsys.exit(3)\n")
+out, _, code = tail_with_env(["tail", tp], {"RESUME_INTERRUPTED_AUDIT_SCAN": bad})
+check(code == 0 and "step one done" in out and "audit" in out.lower() and "3" in out,
+      "a failing scanner is reported in the audit section; the tail itself still succeeds")
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
