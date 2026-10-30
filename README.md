@@ -18,7 +18,9 @@ cracks. This plugin recovers it from the transcript.
   whenever you say "continue" / "pick up where we left off".
 - **Browse mode:** run `interrupted` (or ask Claude to "list interrupted sessions") to see
   *every* unresumed session — most recent first, recommendation marked — so you can jump
-  back into any of them, not just the last.
+  back into any of them, not just the last. `interrupted --all-projects` scans every
+  project folder (sessions launched from project or worktree checkouts are invisible to
+  the plain list from a home launch), labelling each row with its project and window title.
 - **Tail mode:** `interrupted tail <session-id-or-path>` condenses one transcript's end —
   last records, every unanswered prompt (including `queue-operation` ones), unanswered tool
   calls, the verdict and a reset-boundary check. If the optional **audit-loose-ends** plugin
@@ -34,7 +36,7 @@ clean substantive session (you've moved on). Use browse mode to revisit anything
 
 ## How it detects an interruption
 
-A session was interrupted (not ended intentionally) if **either**:
+A session was interrupted (not ended intentionally) if **any** of:
 
 - **(E) Limit / API kill** — its last assistant turn is an API/budget error
   (`Budget has been exceeded`, `API Error: Request rejected`, …).
@@ -43,6 +45,10 @@ A session was interrupted (not ended intentionally) if **either**:
   crashes and dropped connections, not just metered-gateway limits.
 - **(M) Mid-tool kill** — the last assistant turn emitted a `tool_use` whose result never
   arrived: the session died between the call and the tool's completion.
+- **(T) Between-turns kill** — the last human turn WAS answered, but the transcript ends in
+  an `api-request` that never received a response: the session died issuing the next
+  request, after its last completed turn. Every other shape checks a record against its
+  completion; this death lands in the gap *between* turns.
 
 And a session that is **still alive is never offered**: the launcher's live-session
 registry is consulted (a matching entry whose pid is running *and* whose recorded start

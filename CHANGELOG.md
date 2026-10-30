@@ -12,6 +12,33 @@ which is usually the previous release. Release dates are the date of the commit 
 `.claude-plugin/plugin.json` to that version. Entries therefore summarise recorded commits rather
 than reproducing notes written at release time.
 
+## [0.8.0] - 2026-10-30
+
+Three detection gaps closed, all measured on real interrupted sessions.
+
+### Added
+- **(T) between-turns death shape** (`hooks/detect-interrupted.py`): the last human turn was
+  answered and the transcript ends in an `api-request` that never got a response — the
+  session died issuing the next request. Measured 2026-10-29 (session 0a39d429, tail
+  `tool_result → attachment → api-request-blob → api-request`): every prior shape checks a
+  record against its completion, so this death read as "not interrupted" and a
+  half-finished two-deliverable request sat unnoticed ~22h. Classified after (S): an
+  unanswered prompt followed by its own in-flight request stays a stall; (E) still outranks.
+- **`--all-projects`** on `list`/`recommended`: scan every project folder under the projects
+  root instead of only the launch dir's — sessions run in project or worktree checkouts
+  were invisible from a home launch. Rows (and JSON) carry the project folder and the
+  session's custom window title (sidecar `custom-title.json`; missing/corrupt degrades to
+  empty). Subagent transcripts never enter the listing. Scan approach borrowed from
+  cc-transcript's cross-project session discovery.
+- `RESUME_INTERRUPTED_PROJECTS_ROOT` overrides the projects root (tests, unusual installs);
+  set but not a directory is an error for `--all-projects`, never a silent fallback.
+
+### Changed
+- The skill's candidate-pick rule: **a session the user names is an instruction, not a
+  suggestion** — resume it without re-litigating against the newest interrupted session,
+  regardless of verdict; concurrent sessions each resume their own named target instead of
+  racing to the same latest one. `not interrupted` is not `nothing to resume`.
+
 ## [0.7.0] - 2026-10-30
 
 ### Added
