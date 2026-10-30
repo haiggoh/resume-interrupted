@@ -525,8 +525,20 @@ def _unmatched_tool_use(recs):
     return bool(_unanswered_tool_uses(recs))
 
 
+def _between_turns_death(recs):
+    """True when the transcript's trailing records end in an api-request (or api-request-blob)
+    that never received a response: the session died with a request in flight, AFTER its last
+    completed turn. Walks from the end skipping attachment records; anything else following the
+    request — a reply, further activity, an error turn — means that flight completed."""
+    for o in reversed(recs):
+        if o.get("type") == "attachment":
+            continue
+        return o.get("type") in ("api-request", "api-request-blob")
+    return False
+
+
 def classify(path):
-    """Return dict: interrupted, has_work, dangling, reason ('limit-kill'|'connection-drop'|'api-error'|'stalled'|''),
+    """Return dict: interrupted, has_work, dangling, reason ('limit-kill'|'connection-drop'|'api-error'|'stalled'|'mid-tool'|'between-turns'|''),
     work_count (int: genuine assistant work turns), is_downtime_note (bool: the surfaced
     unanswered turn is a queued downtime note masked by a later continuation stub, i.e. not
     the primary session to resume — the primary-vs-downtime CHOICE stays in the orchestration
@@ -591,13 +603,13 @@ def classify(path):
     # automated surface flagged it at all.
     if _unmatched_tool_use(recs):
         return _res(True, last_prompt or last_human, "mid-tool")
+    answered = False                 # did the LAST real human turn get a genuine reply?
     if last_human_idx >= 0:
         # "answered" = a GENUINE assistant reply after the last real human turn. A filler reply
         # under a continuation-stub context does NOT count (else the stub masks the real turn's
         # lack of a reply). Gap-timing heuristic (item 4, NO logic yet): a future pass could
         # compare the gap between last real content and a trailing marker's timestamp to the
         # ~3-min retry-exhaustion window — no observed case warrants it (12 examples all <75s).
-        answered = False
         ctx_stub = False
         for j in range(last_human_idx + 1, len(recs)):
             mj = recs[j].get("message", {})
@@ -614,6 +626,15 @@ def classify(path):
             return _res(True, last_prompt, "stalled")
     elif last_prompt and not _is_stale_last_prompt(recs, last_prompt):
         return _res(True, last_prompt, "stalled")
+    # (T) BETWEEN-TURNS: the last human turn WAS answered and the transcript still ends in an
+    # api-request that never got a response — the session died issuing the next request.
+    # Measured 2026-10-29 (cc-setup-54): tail tool_result -> attachment -> api-request-blob ->
+    # api-request; every shape above checks a record against its completion, so the death in
+    # the gap BETWEEN turns read as "not interrupted" and half-finished work sat unnoticed
+    # ~22h. Kept AFTER (S) on purpose: an UNANSWERED prompt followed by its own in-flight
+    # request is a stall (the request is just the mechanism), and (E) already outranks this.
+    if answered and _between_turns_death(recs):
+        return _res(True, last_prompt or last_human, "between-turns")
 
     return _res(False, "", "")
 

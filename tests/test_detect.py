@@ -917,6 +917,34 @@ check("tool call" in blob and "never returned its result" in blob,
       "mid-tool banner names the shape (killed between the call and its result)")
 check("limit" not in blob.lower(), "mid-tool carries no limit constraint (no reset language)")
 
+print("== v0.8.0: the between-turns death shape — (T) ==")
+# Measured 2026-10-29 (cc-setup-54): the final human turn was fully answered, the session
+# issued the NEXT api-request, and died before any reply arrived — tail is
+# tool_result -> attachment -> api-request-blob -> api-request. Every existing shape checks a
+# record against its completion (error turn / tool_use / unanswered prompt); this death lands
+# in the gap BETWEEN turns, so 0.7.0 read the transcript as "not interrupted" and a
+# half-finished request sat unnoticed for ~22 hours.
+APIREQ = {"type": "api-request", "timestamp": "2026-10-29T17:12:13.396Z"}
+APIREQ_BLOB = {"type": "api-request-blob"}
+ATTACH = {"type": "attachment"}
+BT = [U("make a waypoint and a report"), A("Two things to build: the waypoint and the report."),
+      TOOL, TOOL_RESULT, ATTACH, APIREQ_BLOB, APIREQ]
+c = detect.classify(session(BT))
+check(c["interrupted"] and c["reason"] == "between-turns",
+      "(T) trailing api-request after an answered turn = killed between turns")
+c = detect.classify(session(BT + [A("done — both halves")]))
+check(not c["interrupted"], "(T) a reply after the in-flight request means it completed — healthy")
+# (E) outranks (T), same as it outranks (M): an error turn is the stronger, constraint-carrying verdict.
+c = detect.classify(session([U("go"), A("working"), APIREQ, AERR(BUDGET)]))
+check(c["reason"] == "limit-kill", "(E) an error turn after the api-request still wins over between-turns")
+# An UNANSWERED prompt followed by its own in-flight request is a stall — the request is just
+# the mechanism of the stall, and the dangling-prompt verdict is the useful one.
+c = detect.classify(session([U("go"), A("working"), TOOL, TOOL_RESULT, U("next"), APIREQ]))
+check(c["reason"] == "stalled", "an unanswered prompt followed by its in-flight request is a stall, not between-turns")
+# The tail walk skips attachment records, and must not fire on one alone.
+c = detect.classify(session([U("go"), A("done"), LP("go"), ATTACH]))
+check(not c["interrupted"], "a trailing attachment record alone is not a death")
+
 print("== v0.6.0: the harvest also reads queue-operation records (prompts that never became turns) ==")
 # Real shape (session 52a9a5bf, 2026-10-25 15:11 UTC): a user message typed mid-turn was
 # absorbed into the running context and recorded ONLY as a queue-operation record — never a
