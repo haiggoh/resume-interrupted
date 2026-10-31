@@ -12,6 +12,19 @@ which is usually the previous release. Release dates are the date of the commit 
 `.claude-plugin/plugin.json` to that version. Entries therefore summarise recorded commits rather
 than reproducing notes written at release time.
 
+## [0.8.1] - 2026-10-31 — ⚡️: the recovery-offer context leads with the mark
+
+- The repo's GitHub About emoji (⚡️) now leads the model-facing recovery-offer context — the
+  plugin's credit moment (it just recovered a lost session). The user-visible boxed banner already
+  carried the ⚡️ caps header upstream (with the VS16 presentation note); the all-clean note stays
+  unbranded (idle surface). Plan 2026-10-28, §Wave 3 Task 11 — at 0.8.0 the line had drifted from
+  the plan's :881 survey to :907; located fresh.
+- The `bin/interrupted` CLI carries no idle banner (it prints data rows), so no CLI surface to
+  brand — the plan's "CLI banner" premise decayed; recorded rather than invented.
+- A ≤3-line Branding section in the SKILL.md, the plugin.json description, and the README h1 carry
+  the mark; tests/test_detect.py pins the offer prefix, the unbranded-prefix absence, and the
+  all-clean note's continued plainness.
+
 ## [0.8.0] - 2026-10-30
 
 Three detection gaps closed, all measured on real interrupted sessions.

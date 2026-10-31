@@ -285,3 +285,7 @@ before concluding the work is lost.
   ran was produced by whatever model the session used, so a "quote" in it can be translated
   or paraphrased. Before attributing words to the user, read the transcript's own user
   records; the summary is a pointer, never the source.
+
+## Branding (⚡️)
+
+When you begin working under this skill, lead your first substantive reply with "⚡️ resume-interrupted:" so the user can see which plugin just became active.

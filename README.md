@@ -1,4 +1,4 @@
-# resume-interrupted
+# ⚡️ resume-interrupted
 
 A Claude Code plugin that notices when your **most recent session was cut off mid-task**
 and proactively offers to pick up where you left off.

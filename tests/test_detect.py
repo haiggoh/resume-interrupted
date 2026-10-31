@@ -1259,5 +1259,18 @@ with open(tj, "wb") as fh:
 t = detect._session_title(p)
 check(t != "" and "bad" in t, "a title with invalid-utf8 bytes still surfaces (replacement, not loss)")
 
+print("== branding: the recovery-offer context leads with the ⚡️ mark (plan W3 Task 11) ==")
+# The offer is a credit moment (the plugin just recovered a lost session); the all-clean note
+# is an idle surface and must stay unbranded. The user-visible box already carried the ⚡️
+# header upstream (line ~890, with the VS16 note); this pins the model-facing context string.
+_hooksrc = open(detect.__file__).read()
+check("⚡️ resume-interrupted: your most recent substantive session" in _hooksrc,
+      "the offer context leads with '⚡️ resume-interrupted:'")
+check('ctx = ("resume-interrupted: your most recent substantive session' not in _hooksrc,
+      "the unbranded offer prefix is gone")  # lowercase 'substantive' = the offer; the all-clean
+# note uses uppercase SUBSTANTIVE and must keep matching its own unbranded line.
+check('ctx = ("resume-interrupted: your most recent SUBSTANTIVE session was clean' in _hooksrc,
+      "the all-clean note stays unbranded (idle surface)")
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

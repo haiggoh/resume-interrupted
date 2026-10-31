@@ -904,7 +904,7 @@ def _emit_auto(path, info, others):
              "api-error": "an API error",
              "mid-tool": "a tool call that never returned its result",
              "stalled": "an unanswered prompt"}.get(info["reason"], "an unanswered prompt or API error")
-    ctx = ("resume-interrupted: your most recent substantive session (%s) appears to have been "
+    ctx = ("⚡️ resume-interrupted: your most recent substantive session (%s) appears to have been "
            "interrupted mid-task (%s), so no note that "
            "the work was unfinished could be written at the time. Likely dangling request: \"%s\". "
            "Proactively offer to pick up where it left off — read the tail of that session's "
