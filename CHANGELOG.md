@@ -12,6 +12,12 @@ which is usually the previous release. Release dates are the date of the commit 
 `.claude-plugin/plugin.json` to that version. Entries therefore summarise recorded commits rather
 than reproducing notes written at release time.
 
+## [0.8.2] — 2026-10-31
+
+### Changed
+- The plugin description (plugin.json, and the marketplace listing it feeds) is rewritten to describe
+  the plugin's full current capabilities.
+
 ## [0.8.1] - 2026-10-31 — ⚡️: the recovery-offer context leads with the mark
 
 - The repo's GitHub About emoji (⚡️) now leads the model-facing recovery-offer context — the

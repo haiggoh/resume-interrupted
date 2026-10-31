@@ -11,5 +11,6 @@
 
 
 
-  "refresh_plugin": "resume-interrupted"
+  "refresh_plugin": "resume-interrupted",
+  "require_default_branch_checkout": true
 }

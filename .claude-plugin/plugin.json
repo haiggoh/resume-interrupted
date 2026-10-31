@@ -1,7 +1,7 @@
 {
   "name": "resume-interrupted",
-  "version": "0.8.1",
-  "description": "⚡️ Detects when your most recent session was cut off mid-task (a usage/credit limit, a crash, or a dropped connection leaves no chance to note the work was unfinished) and proactively offers to pick up where you left off. Knows which sessions are still alive (never offers to resume one that is running), recognises a kill between a tool call and its result, and harvests prompts that were queued but never landed as turns.",
+  "version": "0.8.2",
+  "description": "⚡️ Detects when your most recent session in a project was cut off mid-task — a crash, a dropped connection or a usage limit — and offers at startup to pick up where you left off. It never offers a session that is still running, tells you whether a limit that stopped you has reset, and recovers the context from the transcript. The `interrupted` command lists and reviews unfinished sessions.",
   "author": {
     "name": "Heiko Brantsch"
   },
