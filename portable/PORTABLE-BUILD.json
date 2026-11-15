@@ -1,0 +1,77 @@
+{
+  "builder": "scripts/build-portable.py",
+  "builder_version": "1.0.0",
+  "components": [
+    {
+      "adaptation_class": "mechanical",
+      "evidence_level": "source-inspected",
+      "kind": "manifest",
+      "notes": "same name+version as the host manifest; an installed marketplace plugin wins over a synced copy in Code, so no double-run",
+      "path": ".claude-plugin/plugin.json",
+      "surfaces": {
+        "chat": true,
+        "code": true,
+        "cowork": true
+      }
+    },
+    {
+      "adaptation_class": "mechanical",
+      "evidence_level": "source-inspected",
+      "kind": "skill",
+      "notes": "the PATH-guidance sentence is rewritten for the portable layout (no bin/ on PATH)",
+      "path": "skills/resume-interrupted/SKILL.md",
+      "surfaces": {
+        "chat": true,
+        "code": true,
+        "cowork": true
+      }
+    },
+    {
+      "adaptation_class": "native-unchanged",
+      "evidence_level": "source-inspected",
+      "kind": "hooks",
+      "notes": "SessionStart detect hook; hooks stay in hooks/",
+      "path": "hooks/hooks.json",
+      "surfaces": {
+        "chat": false,
+        "code": true,
+        "cowork": true
+      }
+    },
+    {
+      "adaptation_class": "native-unchanged",
+      "evidence_level": "source-inspected",
+      "kind": "hook-script",
+      "notes": "transcript-based interruption detection; stdlib; portable as-is",
+      "path": "hooks/detect-interrupted.py",
+      "surfaces": {
+        "chat": false,
+        "code": true,
+        "cowork": true
+      }
+    },
+    {
+      "adaptation_class": "mechanical",
+      "evidence_level": "source-inspected",
+      "kind": "script",
+      "notes": "bash launcher moved bin/ -> scripts/; derives the plugin root as SCRIPT_DIR/.., which is the portable root from scripts/ \u2014 verbatim copy works",
+      "path": "scripts/interrupted",
+      "surfaces": {
+        "chat": false,
+        "code": true,
+        "cowork": true
+      }
+    }
+  ],
+  "files": {
+    ".claude-plugin/plugin.json": "34d91e87ddf216de7ffa3865d49682e5256f3a2d4610df688a2c2c2050070343",
+    "hooks/detect-interrupted.py": "b7a03853b73b465fc97397a105a44da08db4b6601d5e20a492a3bd7b2382f512",
+    "hooks/hooks.json": "4e63cc82c4f718654582de28f2302138a12966acb2a9497152a6ea4e1ae8100c",
+    "scripts/interrupted": "bfc69282a607b47a960207988b8c2f745f051bb0f6664da8c5df9d3fc82dcd37",
+    "skills/resume-interrupted/SKILL.md": "cf2a03880cea0e45cb75a9e7470705a11b02839953318752fffe0e72a464ebe9"
+  },
+  "schema": "haiggoh-portable-build/1",
+  "source_commit": "a337f8905896906110077e3913817b863076d626",
+  "source_repo": "haiggoh/resume-interrupted",
+  "transform_version": "1"
+}

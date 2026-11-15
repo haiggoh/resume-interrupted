@@ -1,0 +1,1804 @@
+#!/usr/bin/env python3
+"""resume-interrupted — interrupted-session detector.
+
+Two modes:
+
+  (default, SessionStart hook)  Reads the hook JSON on stdin, looks at the MOST RECENT
+      *substantive* prior session in the same project, and if it was cut off mid-task
+      emits a user-visible banner (systemMessage) + a model-facing notice
+      (hookSpecificOutput.additionalContext) so Claude can offer to resume.
+
+  (CLI, any arguments)          The public `interrupted` command (bin/interrupted).
+      `list` / `--list` prints ALL interrupted sessions in the project (most recent
+      first), probes included, with the most likely resume candidate marked, for the
+      on-demand "show me everything I haven't picked back up" flow. `recommended`
+      prints just the one pick. --project does Claude Code's transcript-directory
+      encoding for you; --dir takes an already-encoded directory. --limit/--page/
+      --max-chars page the output by item count AND character budget; --json is the
+      complete, never-paginated contract. Read-only throughout.
+
+      The split between the two modes is exactly "does argv carry anything": the hook
+      is invoked with NO arguments, so an empty argv always stays hook mode. That is
+      what keeps the hook contract intact while the CLI grows.
+
+Why: a session that dies on a usage/credit limit, a crash, or a dropped connection can't
+record afterward that its work was unfinished. The only trace is the transcript.
+
+Design guarantees: never blocks a session (any error -> print nothing, exit 0); stdlib
+only; reads transcripts.
+
+Optional cross-plugin coordination, downstream: after deciding whether to print a
+banner, this hook writes a session-scoped "done" flag to
+`$TMPDIR-or-/tmp/claude-sessionstart-banners/<session_id>.resume-interrupted.done`
+— always, whether or not it printed. Any OTHER plugin's SessionStart hook may poll for
+that file (with its own short, bounded timeout) to sequence its own banner after this
+one (waypoints does this), without resume-interrupted knowing or caring that the other
+plugin exists. One-way, best-effort, presence-only.
+
+Optional cross-plugin coordination, upstream: symmetrically, if no-hidden-changes is
+installed AND enabled (checked via ~/.claude/settings.json's `enabledPlugins`, never a
+code import), this hook briefly polls no-hidden-changes' own analogous flag
+(`<session_id>.no-hidden-changes.done`) before deciding its own banner — so
+no-hidden-changes' banner (meant to read as the most foundational/always-on notice)
+lands first, this one second, and waypoints' (via the downstream flag above) third.
+Waiting is capped at BANNER_WAIT_S and always falls through regardless of whether the
+flag showed up — this hook must never suppress or meaningfully delay its own banner
+just because no-hidden-changes is slow, absent, or the flag format changes. If
+no-hidden-changes isn't installed/enabled, no wait happens at all.
+
+Detection — a session was interrupted if EITHER:
+  (E) ERROR DEATH the last assistant turn is an API error — recognised by the transcript's
+                  own `isApiErrorMessage`/`apiErrorStatus` marker, or (fallback) an error
+                  signature at the START of the turn. A turn that merely *discusses* an
+                  error phrase mid-text is NOT a kill. The KIND is then reported, because
+                  only one of the three carries a constraint into the next session:
+                    limit-kill       quota/budget refusal (429) — the provider said no, and
+                                     that fact expires at the next reset boundary.
+                    connection-drop  the request never reached the provider (DNS failure,
+                                     refused/reset socket, stalled stream). Nothing was used
+                                     up, so there is nothing to reset.
+                    api-error        reached the provider, which failed or was busy (5xx).
+                  Reporting all three as a limit kill is what made a resumed session warn
+                  about a budget that was never the problem.
+  (S) STALLED     the final human input (last user record, or an orphaned last-prompt)
+                  never received an assistant reply.
+
+De-noising: the auto banner considers only the most recent *substantive* session (>=1
+real assistant turn). Bare "are we back yet?" probes are skipped for the recommendation,
+so the offer re-appears after a killed/empty session but goes quiet once a clean
+substantive session exists (i.e. you've moved on). --list still shows probes, for
+transparency, since a "probe" is occasionally a real request typed on a dead connection.
+
+Orphaned queued notes (secondary surfacing): the clean-session suppression above stops the
+full resume offer, but it must NOT silently bury real notes a user typed into dead-end probe
+sessions AFTER the newest substantive session ("I fixed that bug and pushed it", typed while
+checking "are we back yet?" during a down phase). New sessions are created per retry, so
+those probes are chronologically NEWER than the clean top-of-stack — the clean session being
+older does not mean the user has moved past notes typed after it. So when the full offer is
+suppressed, we still scan the NEWER, has_work=False probes ahead of the clean top (bounded to
+a recent window, ORPHANED_NOTE_WINDOW_S, and stopping at the first has_work=True session in
+that range) and, if any hold queued notes, emit a distinct, lightweight one-shot notice (NOT
+the resume banner). This surfaces the content without reopening the moved-on task or nagging.
+
+Platform limitation (not fixable here): a sufficiently abrupt kill can terminate the client
+before ANYTHING is flushed to the session's own .jsonl — no error turn, no dangling prompt,
+no queued note, nothing on disk. Such a session leaves zero transcript trace, so it is
+unrecoverable by design; there is nothing for this script's logic to detect or resume. This
+is a Claude Code platform behaviour, not a bug in this detector.
+"""
+
+import sys, os, json, glob, re, time, datetime, subprocess
+
+ERROR_SIGNATURES = ("Budget has been exceeded", "API Error: Request rejected", "usage limit reached")
+
+# --- Limit-kill constraint staleness -------------------------------------------------
+# A limit kill is the only interruption that carries a CONSTRAINT forward: "you are out of
+# quota" is true at the moment of death and false again once the provider resets. A crash or
+# a dropped connection carries no such state, so this inference is scoped to
+# reason == "limit-kill" and is never applied to anything else.
+#
+# Nothing here learns, stores, or guesses a cap VALUE, and nothing assumes a cap exists: a
+# user who is never limited never gets a limit kill, so this code never runs for them. The
+# entire finding is "a reset boundary has passed since the kill" — which needs no cap.
+#
+# The boundary is HOUR:MINUTE UTC, where the minute is the provider's propagation lag rather
+# than an error bar around midnight: a resume 3 minutes after 00:00 UTC is deliberately NOT
+# treated as reset yet. Both are configurable for providers on other schedules.
+RESET_UTC_HOUR = int(os.environ.get("RESUME_INTERRUPTED_RESET_UTC_HOUR") or 0)
+RESET_PROPAGATION_MIN = int(os.environ.get("RESUME_INTERRUPTED_RESET_PROPAGATION_MIN") or 10)
+
+# --- Live-session registry (v0.6.0) ---------------------------------------------------
+# Claude Code's launcher records each RUNNING session in ~/.claude/sessions/<pid>.json as
+# {pid, sessionId, startedAt (epoch ms), procStart, ...}. A session that is still alive must
+# never be offered as a resume candidate, whatever its transcript tail looks like: a busy
+# autonomous session can go hours between user turns, so a healthy-but-quiet session reads
+# exactly like a stalled one. When the registry cannot answer at all, a transcript written
+# within MAYBE_RUNNING_S is hedged as "may still be running" instead of confidently stalled.
+MAYBE_RUNNING_S = 600                 # no registry answered: a session written this recently MAY be alive
+START_MATCH_TOLERANCE_MS = 120_000    # ps-elapsed vs startedAt slack (clock rounding, ps sampling)
+_registry_warned = {"done": False}
+
+
+def _registry_dir():
+    """(dir, error) for the live-session registry. RESUME_INTERRUPTED_SESSIONS_DIR overrides
+    the default; an override that is SET but unusable is reported on stderr and treated as
+    absent for this run — never a silent fallthrough to the default."""
+    d = os.environ.get("RESUME_INTERRUPTED_SESSIONS_DIR")
+    if d:
+        d = os.path.expanduser(d)
+        if not os.path.isdir(d):
+            return "", ("RESUME_INTERRUPTED_SESSIONS_DIR=%r is not a directory — the "
+                        "live-session registry is treated as absent for this run" % d)
+        return d, ""
+    return os.path.expanduser("~/.claude/sessions"), ""
+
+
+def _registry_ok():
+    d, err = _registry_dir()
+    return (not err) and os.path.isdir(d)
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # the process exists and belongs to someone else
+    except OSError:
+        return False
+
+
+def _ps_start_matches(pid, started_at_ms):
+    """True when the RUNNING process's start matches the record's startedAt (epoch ms).
+
+    Compared via `ps -o etime=` (elapsed time) against now - startedAt, which sidesteps both
+    the timezone frames (a recorded procStart string can sit an hour away from ps's local
+    lstart on a DST boundary) and ps's locale-formatted output. etime is the portable
+    keyword (etimes is Linux-only); its MM:SS / HH:MM:SS / [DD-]HH:MM:SS shapes are parsed
+    defensively. argv is never read. Fails OPEN: when ps has nothing to say, a missing
+    guard must not read a live session as dead — the pid-reuse risk it exists for is
+    narrower than the damage of suppressing a real session."""
+    try:
+        p = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return True
+    out = (p.stdout or "").strip()
+    if p.returncode != 0 or not out:
+        return True
+    try:
+        days = 0
+        rest = out
+        if "-" in out:
+            days, rest = int(out.split("-", 1)[0]), out.split("-", 1)[1]
+        parts = [int(x) for x in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        hh, mm, ss = parts[-3:]
+        elapsed_s = days * 86400 + hh * 3600 + mm * 60 + ss
+    except ValueError:
+        return True
+    started_ms = (time.time() - elapsed_s) * 1000
+    return abs(started_at_ms - started_ms) <= START_MATCH_TOLERANCE_MS
+
+
+def session_live(session_id, registry_dir=None):
+    """True when a registry entry for session_id names a process that is running AND whose
+    start time matches the recorded one — a recycled pid is a DIFFERENT process wearing the
+    same number. Only ever True on positive evidence; any uncertainty answers False."""
+    if not session_id:
+        return False
+    d = registry_dir
+    if d is None:
+        d, err = _registry_dir()
+        if err:
+            if not _registry_warned["done"]:
+                try:
+                    sys.stderr.write("resume-interrupted: %s\n" % err)
+                except Exception:
+                    pass
+                _registry_warned["done"] = True
+            return False
+    try:
+        entries = glob.glob(os.path.join(d, "*.json"))
+    except Exception:
+        return False
+    for path in entries:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except Exception:
+            continue
+        if rec.get("sessionId") != session_id:
+            continue
+        try:
+            pid = int(rec.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not pid or not _pid_alive(pid):
+            continue
+        started = rec.get("startedAt")
+        if isinstance(started, (int, float)) and not _ps_start_matches(pid, float(started)):
+            continue  # the pid was recycled: the recorded session is gone
+        return True
+    return False
+
+
+def _sid_of(path):
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _maybe_running(path, registry_ok):
+    """True when the registry could NOT answer (absent/unreadable) but the transcript was
+    written so recently that the session may still be alive. Such a session is hedged as
+    'may still be running' — never a confident 'never got a reply'."""
+    if registry_ok:
+        return False  # the registry answered; liveness is decided there
+    try:
+        return (time.time() - os.path.getmtime(path)) < MAYBE_RUNNING_S
+    except OSError:
+        return False
+
+
+def _records(path):
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
+
+
+def _human_text(msg):
+    c = msg.get("content")
+    if isinstance(c, str):
+        t = c
+    elif isinstance(c, list):
+        t = ""
+        for b in c:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_result":
+                return None
+            if b.get("type") == "text":
+                t = b.get("text", "")
+                break
+    else:
+        return None
+    if not t or t.lstrip().startswith("<"):
+        return None
+    return t.strip()
+
+
+def _assistant_text(msg):
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    t = ""
+    if isinstance(c, list):
+        for b in c:
+            if isinstance(b, dict) and b.get("type") == "text":
+                t += b.get("text", "")
+    return t
+
+
+def _norm(s):
+    return " ".join((s or "").split())
+
+
+def _quote(s, n=100):
+    """Trim a dangling prompt for the banner: cap length (~100 chars keeps the banner to
+    about one line while giving enough of the prompt to recognise the thread), cut on a
+    WORD boundary, and mark
+    truncation with a single '…'. A mid-word cut ("…from a human persp") reads as if the
+    text itself were severed — a false signal in a tool whose job is flagging severed
+    sessions. Claude Code's own last-prompt marker may already end in '…'; normalise so we
+    never double it and never lose the truncation cue."""
+    s = _norm(s)
+    upstream_cut = s.endswith("…")
+    core = s[:-1].rstrip() if upstream_cut else s
+    if len(core) <= n:
+        return core + "…" if upstream_cut else core
+    cut = core[:n].rstrip()
+    if " " in cut:
+        cut = cut[:cut.rfind(" ")].rstrip()
+    return cut + "…"
+
+
+def _is_error_turn(rec, text):
+    """True if this assistant record is the API/limit error the session died on.
+
+    Trust the transcript's own structural marker first (`isApiErrorMessage`, set by the
+    client on real error turns). Fall back to an ANCHORED text match — an error signature
+    at the START of the turn — so a healthy turn that merely *quotes* an error phrase
+    mid-paragraph (e.g. documenting how to recognise a budget kill) is not mistaken for
+    one. An unanchored `sig in text` match conflates "died on" with "wrote about".
+    """
+    # Structural marker first — wording-agnostic. The client tags real error turns with
+    # isApiErrorMessage / apiErrorStatus regardless of the message text, so this keeps
+    # working when the error wording changes (e.g. the budget cap message) and covers
+    # error kinds we never enumerated (overloaded, rate-limit, server error).
+    if rec.get("isApiErrorMessage") or rec.get("apiErrorStatus"):
+        return True
+    # Legacy fallback for transcripts/harnesses lacking the marker: an error signature at
+    # the START of the turn (anchored — a turn that merely discusses the phrase is not a kill).
+    return _norm(text).startswith(ERROR_SIGNATURES)
+
+
+# Transport-failure wording. These are deaths where the request never reached the provider —
+# a DNS failure, a refused connection, a reset socket, a stream that stopped arriving. They
+# carry NO forward constraint: nothing has been used up, so there is nothing to reset. The
+# quota inference must never be applied to them.
+_TRANSPORT_SIGNATURES = (
+    "unable to connect", "can't reach the api", "cannot reach the api", "connection refused",
+    "enotfound", "econnreset", "econnrefused", "etimedout", "socket hang up",
+    "response stalled mid-stream", "the response stopped arriving", "network",
+)
+
+# Provider-side capacity refusals: the request DID reach the provider, which declined it.
+# Transient by nature and self-clearing without a reset boundary, so they are neither a
+# quota kill nor a transport failure.
+_BUSY_STATUSES = (500, 502, 503, 504, 529)
+
+
+def _error_kind(rec, text):
+    """Which KIND of error death this turn is: 'limit-kill' | 'connection-drop' | 'api-error'.
+
+    Only meaningful for a record `_is_error_turn` already accepted. The distinction matters
+    because ONE of the three carries a constraint into the next session: a quota kill means
+    "you are out of budget", which is true at the moment of death and false after the
+    provider's reset boundary. A dropped connection and a busy server mean nothing of the
+    kind — so labelling them 'limit-kill' makes the next session warn about a budget that
+    was never the problem, which is precisely the misread we tell the agent to avoid.
+
+    Decided on the STATUS CODE first, because it is structural and wording-independent; the
+    text is only consulted when the client recorded no status. Measured against this
+    project's own transcripts: all 118 real quota kills carry apiErrorStatus=429, while
+    every transport death (ENOTFOUND, ECONNRESET, connection refused, stalled stream)
+    carries no status at all — so the status field alone separates the two cleanly.
+    """
+    status = rec.get("apiErrorStatus")
+    if status is not None:
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            status = None
+    if status == 429:
+        return "limit-kill"
+    if status in _BUSY_STATUSES:
+        return "api-error"
+    s = _norm(text).lower()
+    if any(sig in s for sig in _TRANSPORT_SIGNATURES):
+        return "connection-drop"
+    if status is not None:
+        return "api-error"
+    # No status and no transport wording. Fall back to the quota signatures, which is where
+    # a legacy transcript's budget kill lands; anything else is an unclassified API error
+    # rather than an assumed quota kill.
+    if _norm(text).startswith(ERROR_SIGNATURES) or "usage limit" in s or "budget has been exceeded" in s:
+        return "limit-kill"
+    return "api-error"
+
+
+# Availability-probe noise the user types into a dead connection ("are we back yet?"). We
+# drop these when harvesting queued notes so real queued work isn't buried. Conservative:
+# only a SHORT message that is (or clearly contains) an availability check is dropped — a
+# real note is never sacrificed to over-eager filtering.
+_PROBE_EXACT = {
+    "", "?", "hi", "hey", "hello", "yo", "test", "ping", "u there", "you there",
+    "anyone", "anyone there", "alive", "still there", "back", "back yet", "we back",
+    "you back", "are we back", "are we back yet", "ready", "working", "working now",
+    "still blocked", "still down", "still stuck", "you up", "up yet", "you alive",
+}
+_PROBE_KEYWORDS = (
+    "back yet", "are we back", "you there", "still there", "still blocked", "still down",
+    "still stuck", "working now", "you up ", "back online", "are you there",
+    "budget back", "unblocked yet", "you alive", "back yet",
+)
+
+
+def _is_probe_text(t):
+    """True if t is an availability probe ('are we back?') rather than a real queued note."""
+    n = _norm(t).lower().rstrip("?!. ")
+    if n in _PROBE_EXACT:
+        return True
+    if len(n) <= 30 and any(k in n for k in _PROBE_KEYWORDS):
+        return True
+    return False
+
+
+def queued_prompts(recs):
+    """Every unanswered human note queued AFTER the last real assistant work turn, de-noised.
+
+    During a usage/limit down phase the user often queues several valuable notes into a
+    blocked session; none get a reply. Harvesting only the trailing prompt (what the banner
+    quotes) loses the earlier ones. So: find the last assistant turn that did real work
+    (non-empty, not an error), then collect every human turn after it, skipping bare
+    availability probes. Queue-operation records are read too: a prompt typed (or absorbed)
+    mid-turn can exist ONLY as such a record and never as a user turn, so a user-role scan
+    alone loses it. Order preserved, user turns deduped against queue records. Returns []
+    when nothing was queued.
+    """
+    last_work_idx = -1
+    for i, o in enumerate(recs):
+        m = o.get("message", {})
+        if m.get("role") == "assistant":
+            at = _assistant_text(m)
+            if at and not _is_error_turn(o, at):
+                last_work_idx = i
+    out = []
+    seen = set()
+    for o in recs[last_work_idx + 1:]:
+        m = o.get("message", {})
+        if m.get("role") == "user":
+            t = _human_text(m)
+            if t and not _is_probe_text(t):
+                out.append(t)
+                seen.add(_norm(t)[:60])
+    for o in recs[last_work_idx + 1:]:
+        if o.get("type") != "queue-operation":
+            continue
+        t = _norm(o.get("content") or "")
+        if not t or _is_probe_text(t) or _norm(t)[:60] in seen:
+            continue
+        out.append(t)
+        seen.add(_norm(t)[:60])
+    return out
+
+
+def _is_stale_last_prompt(recs, last_prompt):
+    """True if last_prompt merely echoes an EARLIER human turn that already received an
+    assistant reply, rather than genuinely new, unanswered input.
+
+    Claude Code's last-prompt marker tracks the last plain-text prompt but isn't refreshed
+    by slash-command/skill invocations — so after a command round-trips cleanly, the file
+    can still end with one or more last-prompt records echoing the prompt from BEFORE that
+    command, making an already-answered session look like it has fresh dangling input.
+    """
+    norm_lp = _norm(last_prompt)[:60]
+    if not norm_lp:
+        return False
+    for i, o in enumerate(recs):
+        m = o.get("message", {})
+        if m.get("role") != "user":
+            continue
+        t = _human_text(m)
+        if t and _norm(t)[:60] == norm_lp:
+            if any(recs[j].get("message", {}).get("role") == "assistant" for j in range(i + 1, len(recs))):
+                return True
+    return False
+
+
+# Auto-continuation stubs Claude Code injects when a dead/blocked session is resumed while its
+# previous turn never got a genuine reply. These are NOT real human input: a later stub's
+# filler reply ("No response requested.") makes an EARLIER real, never-answered turn look
+# "answered", masking it. classify() therefore skips stubs when finding the last genuine human
+# turn and when deciding "answered". Matched normalized, lower-cased, trailing-punctuation-stripped.
+_CONTINUATION_STUBS = {
+    "continue from where you left off",
+    "continue from where we left off",
+    "no response requested",
+}
+
+
+def _is_continuation_stub(t):
+    """True if t is a Claude Code auto-continuation stub rather than genuine human input."""
+    return _norm(t).lower().rstrip(".!? ") in _CONTINUATION_STUBS
+
+
+def _unanswered_tool_uses(recs):
+    """[(id, tool name)] for every tool_use in the LAST assistant turn carrying tool_use blocks
+    that no later tool_result record answers — the persisted, structurally-detectable mark of a
+    session killed between emitting a tool call and receiving its result."""
+    last_idx, calls = -1, []
+    for i, o in enumerate(recs):
+        m = o.get("message", {})
+        if m.get("role") == "assistant" and isinstance(m.get("content"), list):
+            block_calls = [(b.get("id"), b.get("name") or "?") for b in m["content"]
+                           if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")]
+            if block_calls:
+                last_idx, calls = i, block_calls
+    if last_idx < 0:
+        return []
+    answered = set()
+    for o in recs[last_idx + 1:]:
+        c = (o.get("message") or {}).get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    answered.add(b.get("tool_use_id"))
+    return [(tid, name) for tid, name in calls if tid not in answered]
+
+
+def _unmatched_tool_use(recs):
+    """True if the LAST tool-calling assistant turn has a call no later tool_result answers."""
+    return bool(_unanswered_tool_uses(recs))
+
+
+def _between_turns_death(recs):
+    """True when the transcript's trailing records end in an api-request (or api-request-blob)
+    that never received a response: the session died with a request in flight, AFTER its last
+    completed turn. Walks from the end skipping attachment records; anything else following the
+    request — a reply, further activity, an error turn — means that flight completed."""
+    for o in reversed(recs):
+        if o.get("type") == "attachment":
+            continue
+        return o.get("type") in ("api-request", "api-request-blob")
+    return False
+
+
+def classify(path):
+    """Return dict: interrupted, has_work, dangling, reason ('limit-kill'|'connection-drop'|'api-error'|'stalled'|'mid-tool'|'between-turns'|''),
+    work_count (int: genuine assistant work turns), is_downtime_note (bool: the surfaced
+    unanswered turn is a queued downtime note masked by a later continuation stub, i.e. not
+    the primary session to resume — the primary-vs-downtime CHOICE stays in the orchestration
+    layer, this is just the raw signal)."""
+    recs = _records(path)
+    if not recs:
+        return {"interrupted": False, "has_work": False, "dangling": "", "reason": "",
+                "work_count": 0, "is_downtime_note": False}
+    last_prompt = ""
+    last_human_idx = -1              # last GENUINE (non-stub) human turn
+    last_assistant_is_error = False
+    last_error_kind = ""             # kind of the LAST error turn seen (see _error_kind)
+    work = 0
+    human_ctx_is_stub = False        # is the current human context an auto-continuation stub?
+    for i, o in enumerate(recs):
+        if o.get("type") == "last-prompt":
+            last_prompt = o.get("lastPrompt") or ""
+        m = o.get("message", {})
+        role = m.get("role")
+        if role == "user" and _human_text(m) is not None:
+            if _is_continuation_stub(_human_text(m)):
+                human_ctx_is_stub = True          # skip: not a genuine last human turn
+            else:
+                human_ctx_is_stub = False
+                last_human_idx = i
+        elif role == "assistant":
+            at = _assistant_text(m)
+            last_assistant_is_error = _is_error_turn(o, at)
+            if last_assistant_is_error:
+                last_error_kind = _error_kind(o, at)
+            # A filler reply to a stub (assistant under stub context) is not real work.
+            if at and not last_assistant_is_error and not human_ctx_is_stub:
+                work += 1
+    has_work = work >= 1
+    last_human = _human_text(recs[last_human_idx]["message"]) if last_human_idx >= 0 else ""
+
+    # Downtime-note signal: a continuation stub appears AFTER the last genuine human turn,
+    # meaning that turn was queued while a prior session was dead and later auto-continued.
+    is_downtime_note = False
+    if last_human_idx >= 0:
+        for o in recs[last_human_idx + 1:]:
+            mm = o.get("message", {})
+            if (mm.get("role") == "user" and _human_text(mm) is not None
+                    and _is_continuation_stub(_human_text(mm))):
+                is_downtime_note = True
+                break
+
+    def _res(interrupted, dangling, reason):
+        return {"interrupted": interrupted, "has_work": has_work, "dangling": dangling,
+                "reason": reason, "work_count": work, "is_downtime_note": is_downtime_note}
+
+    if last_assistant_is_error:
+        # The KIND of error death, not an assumed quota kill. Before this, every api-error
+        # death was labelled "limit-kill", so a dropped wifi connection told the next session
+        # a usage limit had been hit.
+        return _res(True, last_prompt or last_human, last_error_kind or "api-error")
+    # (M) MID-TOOL: the last assistant turn emitted tool_use whose result never arrived —
+    # the session died between the call and the tool's completion. Neither (E) (no error
+    # turn: the death beat the API reply) nor (S) (the last real prompt WAS answered: work
+    # was underway). Structural and wording-agnostic. Measured 2026-10-25: a 7-hour
+    # autonomous session died in exactly this shape and matched neither (E) nor (S), so no
+    # automated surface flagged it at all.
+    if _unmatched_tool_use(recs):
+        return _res(True, last_prompt or last_human, "mid-tool")
+    answered = False                 # did the LAST real human turn get a genuine reply?
+    if last_human_idx >= 0:
+        # "answered" = a GENUINE assistant reply after the last real human turn. A filler reply
+        # under a continuation-stub context does NOT count (else the stub masks the real turn's
+        # lack of a reply). Gap-timing heuristic (item 4, NO logic yet): a future pass could
+        # compare the gap between last real content and a trailing marker's timestamp to the
+        # ~3-min retry-exhaustion window — no observed case warrants it (12 examples all <75s).
+        ctx_stub = False
+        for j in range(last_human_idx + 1, len(recs)):
+            mj = recs[j].get("message", {})
+            rj = mj.get("role")
+            if rj == "user" and _human_text(mj) is not None:
+                ctx_stub = _is_continuation_stub(_human_text(mj))
+            elif rj == "assistant" and not ctx_stub:
+                answered = True
+                break
+        if not answered:
+            return _res(True, last_human, "stalled")
+        if (last_prompt and _norm(last_prompt)[:60] != _norm(last_human)[:60]
+                and not _is_stale_last_prompt(recs, last_prompt)):
+            return _res(True, last_prompt, "stalled")
+    elif last_prompt and not _is_stale_last_prompt(recs, last_prompt):
+        return _res(True, last_prompt, "stalled")
+    # (T) BETWEEN-TURNS: the last human turn WAS answered and the transcript still ends in an
+    # api-request that never got a response — the session died issuing the next request.
+    # Measured 2026-10-29 (cc-setup-54): tail tool_result -> attachment -> api-request-blob ->
+    # api-request; every shape above checks a record against its completion, so the death in
+    # the gap BETWEEN turns read as "not interrupted" and half-finished work sat unnoticed
+    # ~22h. Kept AFTER (S) on purpose: an UNANSWERED prompt followed by its own in-flight
+    # request is a stall (the request is just the mechanism), and (E) already outranks this.
+    if answered and _between_turns_death(recs):
+        return _res(True, last_prompt or last_human, "between-turns")
+
+    return _res(False, "", "")
+
+
+def _mtime_str(path):
+    return datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
+
+
+def _session_time_str(path, recs=None):
+    """Display time for a session, from the EVENT time when one exists.
+
+    The banner previously took its header time from the file's mtime while the kill-time line
+    took the transcript's own last timestamp. Two sources for one session, and they disagree in
+    two independent ways: by SOURCE (mtime is when the file was last written, not when the
+    session died — restoring transcripts from a backup or a machine migration resets it, and the
+    header then shows a different DATE from the kill line) and by ZONE (the header rendered local
+    time against a kill line in UTC, so even a healthy session showed a UTC-offset gap).
+
+    Both are fixed here by rendering the same instant _kill_time_utc reports, in local time, with
+    the zone named — so the header and the kill line are reconcilable by inspection instead of
+    looking like a contradiction. When there is no usable event time we fall back to mtime and SAY
+    so, because an unlabelled fallback is what made the original disagreement unreadable.
+    """
+    dt, source = _kill_time_utc(path, recs)
+    if dt is None:
+        return _mtime_str(path)
+    local = dt.astimezone()
+    zone = local.strftime("%Z") or "local"
+    stamp = "%s %s" % (local.strftime("%Y-%m-%d %H:%M"), zone)
+    return stamp if source == "event" else "%s, file mtime" % stamp
+
+
+def _parse_iso_utc(s):
+    """'2026-08-13T15:22:26.936Z' -> aware UTC datetime; None if unparseable or naive.
+
+    A naive timestamp is REFUSED rather than assumed to be UTC — guessing the zone would
+    silently shift the day boundary this whole feature turns on.
+    """
+    if not isinstance(s, str) or not s.strip():
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(datetime.timezone.utc)
+
+
+def _kill_time_utc(path, recs=None):
+    """When the session died, as (aware-UTC datetime, source).
+
+    source is "event" when it comes from the transcript's OWN last timestamp (the real event
+    time) and "mtime" when we fell back to the file's modification time. The two are reported
+    distinctly and never blurred: mtime is when the file was last WRITTEN, which is usually
+    but not always when the session died.
+    """
+    if recs is None:
+        recs = _records(path)
+    for o in reversed(recs):
+        dt = _parse_iso_utc(o.get("timestamp"))
+        if dt:
+            return dt, "event"
+    try:
+        return datetime.datetime.fromtimestamp(os.path.getmtime(path),
+                                               datetime.timezone.utc), "mtime"
+    except OSError:
+        return None, ""
+
+
+def _reset_period_start(dt):
+    """The most recent reset boundary at or before `dt` (both aware UTC)."""
+    boundary = dt.replace(hour=RESET_UTC_HOUR, minute=RESET_PROPAGATION_MIN,
+                          second=0, microsecond=0)
+    if dt < boundary:
+        boundary -= datetime.timedelta(days=1)
+    return boundary
+
+
+def limit_constraint_stale(path, recs=None, now=None):
+    """Has a limit reset happened since this session was killed?
+
+    Returns None when the question can't be answered (no readable kill time). Otherwise:
+      stale     — True iff a reset boundary fell between the kill and now
+      kill_utc  — aware UTC datetime of the kill
+      source    — "event" (transcript timestamp) or "mtime" (file fallback)
+      boundary  — the reset boundary that has since passed, else None
+
+    CALLER CONTRACT: only meaningful for reason == "limit-kill". Comparing reset PERIODS (not
+    calendar dates) is what makes the propagation minute count — a kill at 23:50 and a resume
+    at 00:05 are the same period, so nothing is declared stale.
+    """
+    kill, source = _kill_time_utc(path, recs)
+    if kill is None:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    killed_in = _reset_period_start(kill)
+    now_in = _reset_period_start(now)
+    stale = now_in > killed_in
+    return {"stale": stale, "kill_utc": kill, "source": source,
+            "boundary": now_in if stale else None}
+
+
+def _prior_files(proj, current_sid):
+    files = [f for f in glob.glob(os.path.join(proj, "*.jsonl"))
+             if os.path.basename(f) != "%s.jsonl" % current_sid]
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files
+
+
+def _recommended(proj, current_sid):
+    """Auto-mode candidate: the most recent SUBSTANTIVE session, iff it was interrupted.
+    A clean substantive session (you moved on) suppresses; a killed/empty one is skipped
+    so the offer re-appears; a LIVE session (registry says its process is running) is never
+    a candidate, and neither is one that may still be running (no registry answered and the
+    transcript is fresh). Returns (path, info) or (None, None)."""
+    for f in _prior_files(proj, current_sid):
+        if session_live(_sid_of(f)):
+            continue
+        info = classify(f)
+        if not info["has_work"]:
+            continue
+        if _maybe_running(f, _registry_ok()):
+            continue
+        return (f, info) if info["interrupted"] else (None, None)
+    return (None, None)
+
+
+# How far forward (in wall-clock terms, i.e. how recent relative to now) to look for
+# orphaned queued notes when the full resume-offer is suppressed. Rationale: queued notes
+# are near-term, actionable follow-ups ("I fixed the bug and pushed it", "important data
+# point") worth surfacing for a couple of weeks, but NOT resurrecting a note from months ago
+# the first time this check happens to run. 14 days is a deliberately conservative window:
+# long enough to cover a realistic gap between the dead-end probes and the next real session,
+# short enough that stale threads go quiet on their own.
+ORPHANED_NOTE_WINDOW_S = 14 * 24 * 60 * 60
+
+
+def _orphaned_queued_notes(proj, current_sid):
+    """Queued notes stranded by suppression, from dead-end probes typed AFTER the last clean
+    substantive session.
+
+    Real-world shape this fixes (confirmed against this project's own transcripts, not
+    hypothetical): a session dies on a kill abrupt enough to leave NOTHING on disk (the
+    separately-documented, unfixable platform limitation). The user retries into a brand new
+    session; if the API is still down, THAT one is a bare probe too (has_work=False) — often
+    several in a row, each just an unanswered "are we back yet?" or, sometimes, a real note
+    ("heads up: I manually fixed a bug you created, already pushed") typed while checking.
+    Eventually the API recovers and a genuine, clean, substantive session happens.
+
+    _recommended() correctly walks past those has_work=False probes to find the newest
+    SUBSTANTIVE session for the resume decision — but that substantive session is
+    chronologically OLDER than the probes (new session per retry means retries sort newer,
+    since they were created later in wall-clock time). So "the newest substantive session is
+    clean" does NOT mean the user has seen or moved past notes queued into probes typed AFTER
+    it — it means the opposite: those probes came LATER and are still unacknowledged.
+
+    So this walks the NEWER end of `_prior_files`' newest-first list — i.e. everything before
+    the clean top-of-stack substantive session index — collecting queued notes from
+    has_work=False probes. It stops if it hits ANY has_work=True session in that newer range:
+    that would mean real work actually happened after the probes, which is the caller's
+    responsibility (either _recommended's own check, if newest, or a sign the probes were
+    already superseded by acknowledged work) — not this function's to reach past.
+
+      - Only runs when the top-of-stack substantive session is clean (suppression active).
+        If the newest substantive session was itself interrupted, the full resume banner
+        fires instead and this is not consulted.
+      - Bounded by ORPHANED_NOTE_WINDOW_S measured back from NOW (not from the clean top's
+        mtime — these probes are typically newer than "now minus a bit", so anchoring on the
+        clean top would under-cover exactly the sessions we care about). A probe older than
+        the window is treated as stale and dropped.
+
+    An "older than a clean session, from an even earlier interrupted session" case was also
+    considered (walking backwards past top_idx) but is not exercised here: given sessions are
+    created strictly forward in time on each retry, an interrupted session that predates a
+    clean session was, by construction, already superseded by that later clean session — the
+    user chronologically moved past it. Only the newer-than-clean-top direction reflects how
+    sessions actually get created.
+
+    Returns a list of (path, mtime_str, [notes...]) newest-first, or [] if nothing qualifies.
+    """
+    files = _prior_files(proj, current_sid)
+    # Find the newest substantive session and confirm it's the clean one that suppressed.
+    top_idx = None
+    for i, f in enumerate(files):
+        if classify(f)["has_work"]:
+            top_idx = i
+            break
+    if top_idx is None:
+        return []
+    top = files[top_idx]
+    if classify(top)["interrupted"]:
+        return []  # newest substantive session is interrupted -> full banner handles it
+    cutoff = time.time() - ORPHANED_NOTE_WINDOW_S
+    out = []
+    for f in files[:top_idx]:  # newer than the clean top, newest-first
+        if session_live(_sid_of(f)):
+            continue  # a live probe session is not a dead-end retry; its notes may still land
+        info = classify(f)
+        if info["has_work"]:
+            break  # real work happened after the probes -> not this function's to reach past
+        try:
+            if os.path.getmtime(f) < cutoff:
+                continue  # this probe is stale; a newer one in the same walk may still qualify
+        except OSError:
+            continue
+        notes = queued_prompts(_records(f))
+        if notes:
+            out.append((f, _session_time_str(f), notes))
+    return out
+
+
+def _emit_auto(path, info, others):
+    ts = _session_time_str(path)
+    d = _quote(info["dangling"])
+    queued = queued_prompts(_records(path))
+    extra = ("" if others <= 0 else
+             " (%d other unanswered prompt%s also exist — ask me to list them.)"
+             % (others, "s" if others != 1 else ""))
+    # Reason-aware wording: a limit-kill answered the prompt and then died mid-work, so
+    # "the request was never completed" (only true for a stall) would misreport it.
+    # A limit kill carries a constraint forward; a stall does not. So the reset check runs
+    # here and nowhere else (see limit_constraint_stale's caller contract).
+    # A quota kill is the ONLY reason that carries a constraint forward, so the reset check
+    # runs for it alone (see limit_constraint_stale's caller contract). A connection drop or
+    # a busy-server refusal used nothing up: there is no reset to have passed.
+    fresh = limit_constraint_stale(path) if info["reason"] == "limit-kill" else None
+    if info["reason"] == "limit-kill":
+        line = "Last session (%s) was cut off by a usage/API limit mid-task." % ts
+        req = "Last request: \"%s\"" % d
+    elif info["reason"] == "connection-drop":
+        # Named for what it was. Reporting this as a limit made the next session warn about a
+        # budget that was never the problem — the exact misread the resume notice must avoid.
+        line = "Last session (%s) lost its connection to the API mid-task." % ts
+        req = "Last request: \"%s\"" % d
+    elif info["reason"] == "api-error":
+        line = "Last session (%s) was cut off by an API error mid-task." % ts
+        req = "Last request: \"%s\"" % d
+    elif info["reason"] == "mid-tool":
+        line = "Last session (%s) died between a tool call and its result mid-task." % ts
+        req = "Last request: \"%s\"" % d
+    else:
+        line = "Last session (%s) left a request unanswered." % ts
+        req = "Unfinished: \"%s\"" % d
+    # Boxed WARNING banner: a SessionStart hook's systemMessage can't emit ANSI colour, so
+    # prominence comes from box rules + a caps ⚡ header + blank spacing, not colour. Made
+    # visually dominant so it's hard to overlook regardless of where it lands relative to
+    # other plugins' SessionStart lines (cross-plugin ordering isn't controllable here).
+    # U+26A1 defaults to TEXT presentation without an explicit VS16 (U+FE0F) suffix, so most
+    # terminals render it as a plain glyph, not the colour emoji — unlike waypoints' U+1F9ED,
+    # which defaults to emoji presentation on its own.
+    rule = "━" * 46
+    lines = [rule, "⚡️ INTERRUPTED SESSION — likely unfinished work", line, req]
+    if fresh and fresh["stale"]:
+        lines.append("↻ A limit reset has passed since then — that limit is no longer current.")
+    if queued:
+        lines.append("＋ %d queued note%s from that session:"
+                     % (len(queued), "s" if len(queued) != 1 else ""))
+        for note in queued:
+            lines.append("  · \"%s\"" % _quote(note, 90))
+    lines += ["Say \"continue\" to resume, or \"list interrupted\" to browse.", rule]
+    banner = "\n".join(lines)
+    # Name the cause the transcript actually recorded. The generic "usage-limit/API error"
+    # phrasing invited the agent to assume a quota problem after a mere network blip.
+    cause = {"limit-kill": "a usage/limit error",
+             "connection-drop": "a lost connection to the API",
+             "api-error": "an API error",
+             "mid-tool": "a tool call that never returned its result",
+             "stalled": "an unanswered prompt"}.get(info["reason"], "an unanswered prompt or API error")
+    ctx = ("⚡️ resume-interrupted: your most recent substantive session (%s) appears to have been "
+           "interrupted mid-task (%s), so no note that "
+           "the work was unfinished could be written at the time. Likely dangling request: \"%s\". "
+           "Proactively offer to pick up where it left off — read the tail of that session's "
+           "transcript to recover context, then continue. If the user has clearly moved on, "
+           "mention it once and don't push.%s" % (ts, cause, d, extra))
+    if fresh:
+        # The reason this matters: whatever limit stopped that session was a fact about a
+        # PAST period. Carrying it into this one produces confident, wrong caution — the
+        # agent throttles work, or tells the user they're blocked, on evidence that expired.
+        when = fresh["kill_utc"].strftime("%Y-%m-%d %H:%M UTC")
+        how = ("the transcript's own timestamp" if fresh["source"] == "event"
+               else "the transcript file's last-modified time, not a recorded event time")
+        if fresh["stale"]:
+            ctx += (" IMPORTANT — that interruption was a usage/limit error, and at least one "
+                    "limit reset boundary (%s) has passed since it happened (kill time %s, from "
+                    "%s). The limit that stopped that session is therefore NOT in force now: do "
+                    "not warn the user about it, do not treat it as a current constraint, and do "
+                    "not scale down the plan because of it. If you need the present state, get it "
+                    "from a live signal rather than from that session's error."
+                    % (fresh["boundary"].strftime("%Y-%m-%d %H:%M UTC"), when, how))
+        else:
+            ctx += (" Note: that interruption was a usage/limit error and NO reset boundary has "
+                    "passed since (kill time %s, from %s), so the limit may still be in force — "
+                    "confirm against a live signal before assuming either way." % (when, how))
+    if queued:
+        # Keep this universal: surface the lost notes and let the user decide how to keep
+        # them (a follow-up, a to-do, whatever tool they use). Do NOT name a specific
+        # sibling plugin here — this feature stands alone and must work with none installed.
+        ctx += (" That session also has %d earlier note%s queued during the down phase that never "
+                "got a reply — surface these and offer to help the user capture each as a "
+                "follow-up so it isn't lost: %s"
+                % (len(queued), "s" if len(queued) != 1 else "",
+                   "; ".join("\"%s\"" % _quote(q, 120) for q in queued)))
+    print(json.dumps({"systemMessage": banner,
+                      "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+
+
+def _emit_orphaned_queued_notes(groups):
+    """Lightweight surfacing (NOT the full resume banner) of queued notes stranded in
+    dead-end probe sessions typed AFTER the last clean substantive session. Distinct wording
+    so it never reads as "resume a task" — there's no task to resume, just unacknowledged
+    notes typed while checking whether a down phase had cleared, worth capturing before
+    they're lost. `groups` is the list from _orphaned_queued_notes()."""
+    total = sum(len(notes) for _, _, notes in groups)
+    rule = "─" * 46
+    lines = [rule,
+             "✎ QUEUED NOTES from dead-end retry sessions may be unaddressed",
+             "Your last substantive session was clean, but %d note%s typed into later "
+             "probe/retry session%s never got a reply:"
+             % (total, "s" if total != 1 else "", "s" if total != 1 else "")]
+    for _, ts, notes in groups:
+        for note in notes:
+            lines.append("  · (%s) \"%s\"" % (ts, _quote(note, 90)))
+    lines += ["Ask me to help capture any of these as a follow-up, or say \"list interrupted\".", rule]
+    banner = "\n".join(lines)
+    flat = "; ".join("\"%s\" (%s)" % (_norm(n)[:120], ts)
+                     for _, ts, notes in groups for n in notes)
+    ctx = ("resume-interrupted: your most recent SUBSTANTIVE session was clean, so the full "
+           "resume offer is intentionally suppressed (there's no unfinished task to resume). "
+           "HOWEVER, one or more dead-end probe/retry sessions typed AFTER that clean session "
+           "(e.g. while checking whether a down phase had cleared) still hold %d user note%s "
+           "that never got a reply and would otherwise be lost forever. Do NOT offer to resume "
+           "anything — just surface these once and offer to help capture each as a "
+           "follow-up/to-do so nothing actionable is dropped: %s"
+           % (total, "s" if total != 1 else "", flat))
+    print(json.dumps({"systemMessage": banner,
+                      "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+
+
+def _encode_project_path(path):
+    """Claude Code's transcript-directory encoding for a real filesystem path:
+    /Users/me/Work.dir -> -Users-me-Work-dir. Exposed as its own function so the
+    CLI can do this FOR the user (--project) instead of making them hand-build a
+    path like ~/.claude/projects/-Users-me-Work-dir."""
+    return os.path.abspath(os.path.expanduser(path)).replace("/", "-").replace(".", "-")
+
+
+def _projects_root():
+    # RESUME_INTERRUPTED_PROJECTS_ROOT overrides the projects root (tests; unusual installs).
+    # Returned as-is: the CLI validates it loudly where it CONSUMES it (--all-projects), while
+    # the hook path stays fail-open (a bad override must not fail every session's startup).
+    return os.environ.get("RESUME_INTERRUPTED_PROJECTS_ROOT") or os.path.expanduser("~/.claude/projects")
+
+
+def _project_dir_from_cwd():
+    return os.path.join(_projects_root(), _encode_project_path(os.getcwd()))
+
+
+def _all_project_dirs():
+    """Every project transcript directory under the projects root, for --all-projects."""
+    root = _projects_root()
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return []
+    return [os.path.join(root, e) for e in entries if os.path.isdir(os.path.join(root, e))]
+
+
+def _all_projects_mtime_floor():
+    """--all-projects bounds its work to RECENT sessions: classify() parses whole transcripts,
+    so an ancient multi-GB store must not hang the listing (review finding 2026-10-31), and a
+    recovery target is a recent interruption anyway. Default 14 days; 0 disables the bound;
+    set-but-invalid is a loud error (explicit overrides fail loudly)."""
+    raw = os.environ.get("RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S")
+    if raw is None:
+        return time.time() - 14 * 86400
+    try:
+        window = float(raw)
+    except ValueError as err:
+        raise _CliError("RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S must be a number of "
+                        "seconds, not %r" % raw) from err
+    if window < 0:
+        raise _CliError("RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S must be >= 0, not %r" % raw)
+    return time.time() - window if window > 0 else None
+
+
+def _session_title(path):
+    """The session's custom window title, from the sidecar <sid>/custom-title.json next to the
+    transcript (shape: {"customTitle": "..."}). Missing, corrupt or unreadable -> \"\" — a
+    title is decoration, never fatal."""
+    sid = _sid_of(path)
+    sidecar = os.path.join(os.path.dirname(path), sid, "custom-title.json")
+    try:
+        with open(sidecar, encoding="utf-8", errors="replace") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    title = data.get("customTitle")
+    return title if isinstance(title, str) else ""
+
+
+# ----------------------------------------------------------------------------
+# Public CLI (bin/interrupted). The SessionStart hook invokes this script with NO
+# arguments and hook JSON on stdin; the CLI is therefore everything WITH arguments,
+# which is what keeps the two modes from ever being confused for one another.
+# ----------------------------------------------------------------------------
+
+# Claude Code returns roughly 30,000 characters of a successful command's output
+# inline before switching to a preview plus a saved file. Default a page just under
+# that so the common invocation stays readable in-session; --all opts out.
+CLI_MAX_CHARS_DEFAULT = int(os.environ.get("RESUME_INTERRUPTED_MAX_CHARS") or 26000)
+
+# `interrupted tail`: how much of a transcript's end to condense by default, and the ceiling on
+# an audit digest appended to it (a digest is a pointer to the full scan, not the scan itself).
+TAIL_RECORDS_DEFAULT = 12
+TAIL_CHARS_DEFAULT = 240
+AUDIT_DIGEST_MAX_CHARS = 6000
+AUDIT_SCAN_TIMEOUT_S = 60
+
+CLI_USAGE = """interrupted -- list the sessions in this project that were cut off mid-task.
+
+Usage:
+  interrupted                        list interrupted sessions, newest first
+  interrupted list [options]         the same, said explicitly
+  interrupted recommended [options]  only the session most worth resuming
+  interrupted --list [options]       compatibility alias for list
+  interrupted tail SESSION [options] read one transcript's tail: the last conversational
+                                     records condensed, every unanswered prompt (queue-operation
+                                     records included), unanswered tool calls, the detector's
+                                     verdict, a reset-boundary check, and -- when the
+                                     audit-loose-ends plugin is installed -- its digest.
+                                     SESSION is a transcript path or a session-id prefix
+                                     (looked up in the project directory).
+
+Options:
+  --records N      tail: how many trailing conversational records to show (default %d).
+  --chars N        tail: clip each record's text to N characters (default %d).
+  --no-audit       tail: skip the audit-loose-ends digest even when it is installed.
+  --project PATH   read the project whose working directory is PATH, instead of
+                   the current directory. The transcript-directory encoding is
+                   done for you, so pass a real path such as "$HOME".
+  --dir DIR        read an already-encoded transcript directory directly
+                   (diagnostics; --project is the friendlier form).
+  --limit N        at most N sessions per page. 0 means no item limit.
+  --page N         which page to show, 1-based.
+  --max-chars N    end a page before it exceeds N characters (default %d).
+                   0 disables the character budget.
+  --all            no item and no character limit. For an ordinary terminal or a
+                   redirection; may exceed what Claude Code shows inline.
+  --all-projects   scan every project folder under ~/.claude/projects (or
+                   RESUME_INTERRUPTED_PROJECTS_ROOT), not just this one. Works with
+                   list/recommended; each row is labelled with its project folder.
+                   Bounded to the last 14 days of writes (classify parses whole
+                   transcripts; RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S seconds
+                   overrides, 0 disables).
+  --json           complete machine-readable output. Never paginated.
+  -h, --help       this text.
+
+Environment:
+  RESUME_INTERRUPTED_MAX_CHARS         default for --max-chars.
+  RESUME_INTERRUPTED_AUDIT_SCAN        explicit path to audit-scan.py for `tail`. Set but not a
+                                       file is an error, never a silent fallback.
+  RESUME_INTERRUPTED_PLUGINS_DIR       plugins directory searched for audit-loose-ends
+                                       (default ~/.claude/plugins).
+  RESUME_INTERRUPTED_SESSIONS_DIR      live-session registry (default ~/.claude/sessions).
+  RESUME_INTERRUPTED_PROJECTS_ROOT     projects root for --all-projects (default
+                                       ~/.claude/projects). Set but not a directory is an
+                                       error for --all-projects, never a silent fallback.
+  RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S
+                                       --all-projects recency window in seconds (default
+                                       1209600 = 14 days; 0 disables). Invalid is an error.
+
+Read-only: no transcript and no recovery state is ever modified.
+""" % (TAIL_RECORDS_DEFAULT, TAIL_CHARS_DEFAULT, CLI_MAX_CHARS_DEFAULT)
+
+
+# Room set aside for the two pagination-footer lines, so adding them can never be
+# what tips a page over its character budget.
+FOOTER_RESERVE = 120
+
+LIST_HEADER = "Interrupted sessions in this project (most recent first):\n"
+LIST_HEADER_CROSS = "Interrupted sessions across ALL project folders (most recent first):\n"
+
+LIST_TRAILER = (
+    "\n  '>' = most likely the one to resume (most recent session with real work).\n"
+    "  [work] had substantive work; [probe] only an unanswered prompt — usually a failed\n"
+    "  availability check, but shown in case it was a real request typed on a dead connection.")
+
+
+class _CliError(Exception):
+    pass
+
+
+def _parse_cli(argv):
+    """Hand-rolled rather than argparse so that --list stays a first-class alias for
+    the list subcommand, and so an unrecognised flag is a loud error instead of a
+    silent no-op. argv is the full sys.argv."""
+    args = list(argv[1:])
+    opts = {"cmd": None, "project": None, "dir": None, "limit": 0, "page": 1,
+            "max_chars": CLI_MAX_CHARS_DEFAULT, "json": False, "all": False,
+            "all_projects": False,
+            "target": None, "records": TAIL_RECORDS_DEFAULT, "chars": TAIL_CHARS_DEFAULT,
+            "no_audit": False}
+    if args and args[0] in ("list", "recommended", "tail", "help"):
+        opts["cmd"] = args.pop(0)
+    valued = {"--project": "project", "--dir": "dir", "--limit": "limit",
+              "--page": "page", "--max-chars": "max_chars",
+              "--records": "records", "--chars": "chars"}
+    floors = {"page": 1, "records": 1, "chars": 20}
+    while args:
+        a = args.pop(0)
+        if a in valued:
+            key = valued[a]
+            if not args:
+                raise _CliError("%s needs a value" % a)
+            v = args.pop(0)
+            if key in ("limit", "page", "max_chars", "records", "chars"):
+                try:
+                    v = int(v)
+                except ValueError:
+                    raise _CliError("%s needs a whole number, not %s" % (a, v))
+                floor = floors.get(key, 0)
+                if v < floor:
+                    raise _CliError("%s must be %d or more" % (a, floor))
+            opts[key] = v
+        elif a == "--no-audit":
+            opts["no_audit"] = True
+        elif opts["cmd"] == "tail" and not a.startswith("-") and opts["target"] is None:
+            opts["target"] = a
+        elif a == "--list":
+            if opts["cmd"] is None:
+                opts["cmd"] = "list"
+        elif a == "--json":
+            opts["json"] = True
+        elif a == "--all":
+            opts["all"] = True
+            opts["limit"] = 0
+            opts["max_chars"] = 0
+        elif a == "--all-projects":
+            opts["all_projects"] = True
+        elif a in ("-h", "--help"):
+            opts["cmd"] = "help"
+        else:
+            raise _CliError("unknown argument %s (try: interrupted --help)" % a)
+    if opts["all_projects"] and (opts["project"] or opts["dir"]):
+        raise _CliError("--all-projects scans every project folder; --project/--dir pick ONE")
+    if opts["cmd"] is None:
+        opts["cmd"] = "list"
+    return opts
+
+
+def _resolve_project_dir(opts):
+    """--dir wins (it is already encoded), then --project (encoded here), then cwd."""
+    if opts.get("dir"):
+        return opts["dir"]
+    if opts.get("project"):
+        return os.path.join(_projects_root(), _encode_project_path(opts["project"]))
+    return _project_dir_from_cwd()
+
+
+def _collect_rows(proj, all_projects=False, mtime_floor=None):
+    """All interrupted sessions newest-first, plus the recommended one.
+
+    The recommendation is derived from the COMPLETE set, never from a page, so
+    paginating can never move or lose the '>' marker. all_projects=True scans every
+    project directory under the projects root (depth-1 per directory: subagent
+    transcripts live in a per-session subagents/ subdir and are never seen — and an
+    explicit guard keeps out one symlinked to project level). mtime_floor bounds the
+    cross-project scan to recent transcripts (classify parses whole files)."""
+    reg_ok = _registry_ok()
+    rows = []
+    for pdir in (_all_project_dirs() if all_projects else [proj]):
+        for f in _prior_files(pdir, current_sid=""):
+            if all_projects and "subagents" in os.path.realpath(f).split(os.sep):
+                continue  # defense in depth: a subagent transcript, including one whose
+            # SYMLINK sits at project level (the link path itself names no subagents part)
+            if mtime_floor and os.path.getmtime(f) < mtime_floor:
+                continue  # outside the recency window — not a recovery target
+            if session_live(_sid_of(f)):
+                continue  # a LIVE session is not an interrupted one, whatever its tail
+            info = classify(f)
+            if info["interrupted"]:
+                extra = {"may_be_running": _maybe_running(f, reg_ok)}
+                if all_projects:
+                    extra["project"] = os.path.basename(pdir)
+                    extra["title"] = _session_title(f)
+                info = dict(info, **extra)
+                rows.append((f, info))
+    rows.sort(key=lambda fi: os.path.getmtime(fi[0]), reverse=True)
+    rec_path = None
+    for f, info in rows:  # newest-first: first substantive interrupted is the pick
+        if info["has_work"] and not info.get("may_be_running"):
+            rec_path = f
+            break
+    return rows, rec_path
+
+
+def _render_row(f, info, rec_path):
+    """One session's lines, as a single string with no trailing newline."""
+    mark = "> RECOMMENDED" if f == rec_path else "             "
+    kind = "work " if info["has_work"] else "probe"
+    note = " downtime-note" if info.get("is_downtime_note") else ""
+    lines = ["  %s  %s  [%s]  %2dwt  %-10s%s  \"%s\"" % (
+        mark, _session_time_str(f), kind, info.get("work_count", 0),
+        info["reason"], note, _norm(info["dangling"])[:80])]
+    # Every note queued during the down phase, so a multi-note queue isn't lost to
+    # the single trailing quote above (each is a candidate follow-up).
+    for q in queued_prompts(_records(f)):
+        lines.append("                   · queued: \"%s\"" % (_norm(q)[:90]))
+    if info.get("may_be_running"):
+        lines.append("                   · may still be running (no live-session registry answered)")
+    if info.get("project"):
+        title = info.get("title") or ""
+        lines.append("                   · project %s%s" % (
+            info["project"], (" — \"%s\"" % _norm(title)[:70]) if title else ""))
+    return "\n".join(lines)
+
+
+def _paginate(blocks, limit, max_chars, page):
+    """Slice pre-rendered blocks into pages by BOTH an item count and a character
+    budget, whichever binds first. Returns (page_blocks, start_index, has_more).
+
+    Character-bounded pages are why this is not a simple list slice: title and
+    queued-note lengths vary, so a fixed item count either wastes the budget or
+    overshoots it. A block always lands whole -- one session is never split across
+    a page boundary. A single oversized block is still emitted alone, so no session
+    can be silently unreachable."""
+    pages = []
+    cur, cur_chars = [], 0
+    for b in blocks:
+        n = len(b) + 1
+        over_items = limit and len(cur) >= limit
+        over_chars = max_chars and cur and (cur_chars + n) > max_chars
+        if over_items or over_chars:
+            pages.append(cur)
+            cur, cur_chars = [], 0
+        cur.append(b)
+        cur_chars += n
+    if cur or not pages:
+        pages.append(cur)
+    idx = page - 1
+    if idx >= len(pages):
+        return [], sum(len(p) for p in pages), False
+    start = sum(len(p) for p in pages[:idx])
+    return pages[idx], start, idx + 1 < len(pages)
+
+
+def _next_page_cmd(opts, page):
+    """The exact command that shows the next page, echoing the options in force."""
+    parts = ["interrupted", "list"]
+    if opts.get("all_projects"):
+        parts.append("--all-projects")
+    if opts.get("project"):
+        parts.append("--project %s" % opts["project"])
+    if opts.get("dir"):
+        parts.append("--dir %s" % opts["dir"])
+    if opts.get("limit"):
+        parts.append("--limit %d" % opts["limit"])
+    if opts.get("max_chars") != CLI_MAX_CHARS_DEFAULT:
+        parts.append("--max-chars %d" % opts["max_chars"])
+    parts.append("--page %d" % page)
+    return " ".join(parts)
+
+
+def _row_json(f, info, rec_path):
+    return {"path": f,
+            "session_id": os.path.splitext(os.path.basename(f))[0],
+            "time": _session_time_str(f),
+            "kind": "work" if info["has_work"] else "probe",
+            "work_count": info.get("work_count", 0),
+            "reason": info["reason"],
+            "is_downtime_note": bool(info.get("is_downtime_note")),
+            "may_be_running": bool(info.get("may_be_running")),
+            "project": info.get("project"),
+            "title": info.get("title") or "",
+            "dangling": _norm(info["dangling"]),
+            "queued": [_norm(q) for q in queued_prompts(_records(f))],
+            "recommended": f == rec_path}
+
+
+# ----------------------------------------------------------------------------
+# `interrupted tail` -- the transcript tail parser. Recovery step 3-4 of SKILL.md used to be
+# done by hand-rolled inline python every time; this is that, once, read-only.
+# ----------------------------------------------------------------------------
+
+def _clip(s, n):
+    s = _norm(s)
+    return s if len(s) <= n else s[:max(1, n - 1)].rstrip() + "…"
+
+
+def _tool_input_summary(inp):
+    """One short `key=value` for a tool call's input: enough to recognise the call."""
+    if not isinstance(inp, dict) or not inp:
+        return ""
+    for k in ("command", "file_path", "path", "pattern", "query", "url", "skill", "description",
+              "prompt"):
+        if k in inp:
+            return "%s=%s" % (k, _norm(str(inp[k])))
+    return ",".join(sorted(str(k) for k in inp))
+
+
+def _result_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _condense_record(idx, rec, n):
+    """One conversational record -> {index, role, parts:[str]}; None if nothing to show.
+    Thinking blocks are skipped: they carry no recoverable intent and a lot of noise."""
+    m = rec.get("message") or {}
+    role = m.get("role")
+    c = m.get("content")
+    parts = []
+    if isinstance(c, str):
+        if c.strip():
+            parts.append(_clip(c, n))
+    elif isinstance(c, list):
+        for b in c:
+            if not isinstance(b, dict):
+                continue
+            t = b.get("type")
+            if t == "text" and (b.get("text") or "").strip():
+                parts.append(_clip(b["text"], n))
+            elif t == "tool_use":
+                s = _tool_input_summary(b.get("input"))
+                parts.append(_clip("tool_use %s%s [%s]" % (
+                    b.get("name") or "?", " " + s if s else "", b.get("id") or "?"), n))
+            elif t == "tool_result":
+                flag = "ERROR" if b.get("is_error") else "ok"
+                parts.append(_clip("tool_result [%s] %s: %s" % (
+                    b.get("tool_use_id") or "?", flag, _result_text(b.get("content"))), n))
+    if not parts:
+        return None
+    return {"index": idx, "role": role, "error_turn": bool(rec.get("isApiErrorMessage")),
+            "parts": parts}
+
+
+def _tail_records(recs, count, n):
+    """The last `count` conversational records, condensed. Only type user/assistant count:
+    the api-request-blob bookkeeping records also carry a role and would otherwise crowd out
+    the real turns."""
+    shown = []
+    for i in range(len(recs) - 1, -1, -1):
+        o = recs[i]
+        if o.get("type") not in ("user", "assistant"):
+            continue
+        row = _condense_record(i, o, n)
+        if row:
+            shown.append(row)
+            if len(shown) >= count:
+                break
+    shown.reverse()
+    return shown
+
+
+def _resolve_tail_target(opts):
+    """A transcript path, or a session-id prefix looked up in the project directory."""
+    target = opts["target"]
+    if not target:
+        raise _CliError("tail needs a session: a transcript path or a session-id prefix "
+                        "(try: interrupted tail --help)")
+    if os.path.isfile(target):
+        return target
+    if os.sep in target or target.endswith(".jsonl"):
+        raise _CliError("no such transcript: %s" % target)
+    proj = _resolve_project_dir(opts)
+    if not os.path.isdir(proj):
+        raise _CliError("no session %r: project transcript directory %s does not exist"
+                        % (target, proj))
+    hits = sorted(f for f in glob.glob(os.path.join(proj, target + "*.jsonl")))
+    if not hits:
+        raise _CliError("no transcript starting with %r in %s" % (target, proj))
+    if len(hits) > 1:
+        raise _CliError("%r is ambiguous in %s: %s" % (
+            target, proj, ", ".join(os.path.basename(h)[:12] for h in hits[:6])))
+    return hits[0]
+
+
+def _version_key(name):
+    """Numeric sort key for a version directory name; non-numeric parts sort as 0 so a stray
+    directory can never outrank a real release. Lexical order is wrong: 0.9.0 > 0.13.1."""
+    return tuple(int(p) if p.isdigit() else 0 for p in re.split(r"[.\-+]", name))
+
+
+def _find_audit_scan():
+    """Path to audit-loose-ends' audit-scan.py, or None when the plugin is not installed.
+
+    Order: RESUME_INTERRUPTED_AUDIT_SCAN (explicit; set but unusable is an ERROR, never a
+    fall-through to the next layer) -> the installPath installed_plugins.json records -> the
+    highest numeric version under cache/*/audit-loose-ends. A SOFT dependency: absence is a
+    silent None, only a bad explicit override raises."""
+    override = os.environ.get("RESUME_INTERRUPTED_AUDIT_SCAN")
+    if override:
+        if not os.path.isfile(override):
+            raise _CliError("RESUME_INTERRUPTED_AUDIT_SCAN=%s is not a file" % override)
+        return override
+    base = os.environ.get("RESUME_INTERRUPTED_PLUGINS_DIR") or os.path.expanduser("~/.claude/plugins")
+    try:
+        with open(os.path.join(base, "installed_plugins.json"), encoding="utf-8") as fh:
+            plugins = (json.load(fh) or {}).get("plugins") or {}
+        for key, entries in plugins.items():
+            if key.split("@")[0] != "audit-loose-ends" or not isinstance(entries, list):
+                continue
+            for e in reversed(entries):
+                cand = os.path.join((e or {}).get("installPath") or "", "scripts", "audit-scan.py")
+                if os.path.isfile(cand):
+                    return cand
+    except (OSError, ValueError, AttributeError):
+        pass  # no registry / unreadable: fall through to the cache scan
+    cands = glob.glob(os.path.join(base, "cache", "*", "audit-loose-ends", "*", "scripts",
+                                   "audit-scan.py"))
+    if not cands:
+        return None
+    return max(cands, key=lambda p: _version_key(os.path.basename(os.path.dirname(os.path.dirname(p)))))
+
+
+def _run_audit_scan(scan, transcript):
+    """Run the scanner on ONE explicit transcript path (never --last: it ranks by mtime).
+    Returns {status, text}; never raises, so a broken scanner cannot take the tail down."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_SESSION_ID"}
+    # The scanner's wrong-subject guard compares against this session's id and would call the
+    # resumed session "NOT THIS SESSION" -- true, and exactly the point of resuming it.
+    try:
+        r = subprocess.run([sys.executable, scan, transcript], capture_output=True, text=True,
+                           timeout=AUDIT_SCAN_TIMEOUT_S, env=env)
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout after %ds" % AUDIT_SCAN_TIMEOUT_S, "text": "", "scanner": scan}
+    except OSError as e:
+        return {"status": "could not start: %s" % e, "text": "", "scanner": scan}
+    if r.returncode != 0:
+        first = (r.stderr.strip().splitlines() or ["no stderr"])[0]
+        return {"status": "scanner exited %d: %s" % (r.returncode, first), "text": "",
+                "scanner": scan}
+    text = r.stdout.strip()
+    if len(text) > AUDIT_DIGEST_MAX_CHARS:
+        text = text[:AUDIT_DIGEST_MAX_CHARS].rstrip() + (
+            "\n… (digest cut at %d chars; run: python3 %s %s)" % (
+                AUDIT_DIGEST_MAX_CHARS, scan, transcript))
+    return {"status": "ok", "text": text, "scanner": scan}
+
+
+def _reset_check(path, recs, reason):
+    """The reset-boundary arithmetic, offered for EVERY interrupted session. Only (E) knows it
+    was a quota kill; a mid-tool or stalled death can be one too when the kill beat the API reply
+    and left no error turn, so the verdict is labelled with when it applies."""
+    fresh = limit_constraint_stale(path, recs)
+    if fresh is None:
+        return {"applies": reason == "limit-kill", "known": False, "text": "no readable kill time"}
+    when = fresh["kill_utc"].strftime("%Y-%m-%d %H:%M UTC")
+    src = "transcript timestamp" if fresh["source"] == "event" else "file mtime, not an event time"
+    if fresh["stale"]:
+        verdict = ("a reset boundary (%s) HAS passed since the kill at %s (%s) -- a quota limit "
+                   "would no longer be in force" % (fresh["boundary"].strftime("%Y-%m-%d %H:%M UTC"),
+                                                    when, src))
+    else:
+        verdict = ("no reset boundary has passed since the kill at %s (%s) -- a quota limit may "
+                   "still apply; confirm against a live signal" % (when, src))
+    return {"applies": reason == "limit-kill", "known": True, "stale": fresh["stale"], "text": verdict}
+
+
+def _run_tail(opts):
+    path = _resolve_tail_target(opts)
+    recs = _records(path)
+    if not recs:
+        raise _CliError("%s has no readable records" % path)
+    sid = _sid_of(path)
+    info = classify(path)
+    live = session_live(sid)
+    queue_texts = {_norm(o.get("content") or "")[:60] for o in recs
+                   if o.get("type") == "queue-operation"}
+    queued = [{"text": _norm(q), "source": "queue-operation" if _norm(q)[:60] in queue_texts
+               else "user turn"} for q in queued_prompts(recs)]
+    unanswered = [{"id": i, "tool": n} for i, n in _unanswered_tool_uses(recs)]
+    reset = _reset_check(path, recs, info["reason"]) if info["interrupted"] else None
+    rows = _tail_records(recs, opts["records"], opts["chars"])
+    audit = None
+    if not opts["no_audit"]:
+        scan = _find_audit_scan()  # raises on a bad explicit override, even before any output
+        if scan:
+            audit = _run_audit_scan(scan, path)
+
+    if opts["json"]:
+        print(json.dumps({
+            "path": path, "session_id": sid, "records_total": len(recs),
+            "interrupted": info["interrupted"], "reason": info["reason"], "live": bool(live),
+            "dangling": _norm(info["dangling"]), "queued": queued,
+            "unanswered_tool_use": unanswered, "reset_check": reset, "records": rows,
+            "audit": audit}))
+        return 0
+
+    out = ["transcript  %s" % path,
+           "session     %s   (%d records; read-only)" % (sid, len(recs)),
+           "verdict     %s%s%s" % (
+               ("interrupted: " + info["reason"]) if info["interrupted"] else "not interrupted",
+               "" if info["has_work"] else " (no substantive work)",
+               "   LIVE session -- do not double-drive" if live else "")]
+    if info["dangling"]:
+        out.append("dangling    \"%s\"" % _clip(info["dangling"], opts["chars"]))
+    out.append("")
+    out.append("Last %d conversational record(s):" % len(rows))
+    for r in rows:
+        tag = "%s%s" % (r["role"], " [API ERROR]" if r["error_turn"] else "")
+        for k, p in enumerate(r["parts"]):
+            out.append("  #%-5d %-22s %s" % (r["index"], tag if k == 0 else "", p))
+    out.append("")
+    if queued:
+        out.append("Unanswered prompts (%d):" % len(queued))
+        for q in queued:
+            note = (" -- recorded ONLY as a queue-operation, never became a user turn"
+                    if q["source"] == "queue-operation" else "")
+            out.append("  · \"%s\"%s" % (_clip(q["text"], opts["chars"]), note))
+    else:
+        out.append("Unanswered prompts: none found in the transcript "
+                   "(sidecar files and ~/.claude/history.jsonl may still hold some).")
+    if unanswered:
+        out.append("Unanswered tool_use (killed before its result): " + ", ".join(
+            "%s %s" % (u["id"], u["tool"]) for u in unanswered))
+    if reset is not None:
+        label = "reset-boundary check" if reset["applies"] else (
+            "reset-boundary check (only relevant if this was a quota/limit kill)")
+        out.append("%s: %s" % (label, reset["text"]))
+    if audit is not None:
+        out.append("")
+        out.append("── audit-loose-ends digest (%s) ──" % audit["status"])
+        if audit["text"]:
+            out.append(audit["text"])
+    print("\n".join(out))
+    return 0
+
+
+def _cli(argv):
+    """The public `interrupted` command. Read-only throughout."""
+    try:
+        opts = _parse_cli(argv)
+    except _CliError as e:
+        sys.stderr.write("interrupted: %s\n" % e)
+        return 2
+
+    if opts["cmd"] == "help":
+        sys.stdout.write(CLI_USAGE)
+        return 0
+
+    if opts["cmd"] == "tail":
+        try:
+            return _run_tail(opts)
+        except _CliError as e:
+            sys.stderr.write("interrupted: %s\n" % e)
+            return 2
+
+    all_projects = opts["all_projects"]
+    if all_projects:
+        root = _projects_root()
+        if os.environ.get("RESUME_INTERRUPTED_PROJECTS_ROOT") and not os.path.isdir(root):
+            sys.stderr.write("interrupted: RESUME_INTERRUPTED_PROJECTS_ROOT is set but %r is "
+                             "not a directory\n" % root)
+            return 2
+        try:
+            mtime_floor = _all_projects_mtime_floor()
+        except _CliError as e:
+            sys.stderr.write("interrupted: %s\n" % e)
+            return 2
+        rows, rec_path = _collect_rows(None, all_projects=True, mtime_floor=mtime_floor)
+        proj = root
+    else:
+        proj = _resolve_project_dir(opts)
+        if not os.path.isdir(proj):
+            if opts["json"]:
+                print(json.dumps({"project_dir": proj, "total": 0, "items": [],
+                                  "error": "no such project transcript directory"}))
+            else:
+                print("No project transcript directory found (%s)." % proj)
+            return 0
+        rows, rec_path = _collect_rows(proj)
+
+    if opts["cmd"] == "recommended":
+        rec = [(f, i) for f, i in rows if f == rec_path]
+        if opts["json"]:
+            print(json.dumps({"project_dir": proj,
+                              "recommended": _row_json(rec[0][0], rec[0][1], rec_path)
+                              if rec else None}))
+        elif rec:
+            print(_render_row(rec[0][0], rec[0][1], rec_path))
+        else:
+            print("No interrupted session with substantive work across all project folders."
+                  if all_projects
+                  else "No interrupted session with substantive work in this project.")
+        return 0
+
+    if opts["json"]:
+        # Never paginated: the JSON contract is the complete set.
+        print(json.dumps({"project_dir": proj, "total": len(rows),
+                          "items": [_row_json(f, i, rec_path) for f, i in rows]}))
+        return 0
+
+    if not rows:
+        print("No interrupted sessions found across all project folders." if all_projects
+              else "No interrupted sessions found in this project.")
+        return 0
+
+    blocks = [_render_row(f, i, rec_path) for f, i in rows]
+    # The budget is a ceiling on the WHOLE output, so the fixed header, trailer and
+    # pagination footer are charged to it rather than being allowed to push a page
+    # over the edge.
+    budget = opts["max_chars"]
+    if budget:
+        budget = max(1, budget - (len(LIST_HEADER_CROSS if all_projects else LIST_HEADER)
+                                  + len(LIST_TRAILER) + FOOTER_RESERVE))
+    shown, start, has_more = _paginate(blocks, opts["limit"], budget, opts["page"])
+    if not shown:
+        print("Page %d is past the end (%d session(s) total)." % (opts["page"], len(rows)))
+        return 0
+
+    parts = [LIST_HEADER_CROSS if all_projects else LIST_HEADER]
+    parts.extend(shown)
+    if start or has_more:
+        parts.append("\n  Showing %d-%d of %d." % (start + 1, start + len(shown), len(rows)))
+        if has_more:
+            parts.append("  Next: %s" % _next_page_cmd(opts, opts["page"] + 1))
+    parts.append(LIST_TRAILER)
+    text = "\n".join(parts)
+    if opts["max_chars"] and len(text) > opts["max_chars"]:
+        # A page always carries at least one WHOLE session, so a budget too small to
+        # hold one session plus the fixed header cannot be honoured. Shipping the
+        # session and saying so beats both a silent overshoot and a session that no
+        # page could ever reach.
+        text += ("\n  (--max-chars %d is smaller than one session plus this header, "
+                 "so one session is shown anyway.)" % opts["max_chars"])
+    print(text)
+    return 0
+
+
+def _run_list(argv):
+    """Retained entry point for --list. The CLI supersedes it; kept so anything
+    calling it directly keeps working."""
+    return _cli(argv)
+
+
+def _banner_flag_dir():
+    return os.path.join(os.environ.get("TMPDIR") or os.environ.get("XDG_RUNTIME_DIR")
+                         or "/tmp", "claude-sessionstart-banners")
+
+
+BANNER_WAIT_S = float(os.environ.get("RESUME_INTERRUPTED_BANNER_WAIT_S") or 0.75)
+BANNER_POLL_S = float(os.environ.get("RESUME_INTERRUPTED_BANNER_POLL_S") or 0.05)
+
+
+def _settings_path():
+    return os.environ.get("CLAUDE_SETTINGS_FILE") or os.path.expanduser(
+        "~/.claude/settings.json")
+
+
+def _plugin_enabled(slug_prefix):
+    """True if any `enabledPlugins` key like '<slug_prefix>@<marketplace>' is truthy.
+    Never raises — a missing/malformed settings file just means 'not detected'."""
+    try:
+        import re
+        with open(_settings_path()) as f:
+            settings = json.load(f)
+        enabled = settings.get("enabledPlugins") or {}
+        pat = re.compile(r"^%s@" % re.escape(slug_prefix))
+        return any(pat.match(k) and v for k, v in enabled.items())
+    except Exception:
+        return False
+
+
+def _wait_for_no_hidden_changes(sid):
+    """Presence-only poll for no-hidden-changes' done flag, bounded by BANNER_WAIT_S.
+    Content is never parsed — a malformed/stale flag can't cause a false wait, only its
+    mere existence matters. No-op if sid is empty or no-hidden-changes isn't enabled."""
+    if not sid or not _plugin_enabled("no-hidden-changes"):
+        return
+    flag = os.path.join(_banner_flag_dir(), "%s.no-hidden-changes.done" % sid)
+    deadline = time.monotonic() + BANNER_WAIT_S
+    while time.monotonic() < deadline:
+        if os.path.exists(flag):
+            return
+        time.sleep(BANNER_POLL_S)
+
+
+def _signal_done(sid, printed):
+    """Best-effort, session-scoped 'I'm done deciding' flag for any OTHER plugin's
+    SessionStart hook to optionally poll on. Never raises; never blocks; sid-less
+    sessions (unparseable stdin) get no flag, since nothing could key on them anyway."""
+    if not sid:
+        return
+    try:
+        d = _banner_flag_dir()
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        path = os.path.join(d, "%s.resume-interrupted.done" % sid)
+        tmp = path + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as f:
+            f.write("producer=resume-interrupted printed=%d\n" % (1 if printed else 0))
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _run_auto():
+    sid = ""
+    printed = False
+    try:
+        try:
+            data = json.load(sys.stdin)
+        except Exception:
+            return
+        tp = data.get("transcript_path") or ""
+        sid = data.get("session_id") or ""
+        _wait_for_no_hidden_changes(sid)
+        if not tp:
+            return
+        proj = os.path.dirname(tp)
+        if not os.path.isdir(proj):
+            return
+        path, info = _recommended(proj, sid)
+        if not path:
+            # Full resume offer is suppressed (newest substantive session is clean, or there
+            # is none). Before going fully silent, check whether an earlier interrupted
+            # session within the recency window stranded real queued notes — surface those in
+            # a distinct, non-nagging way so actionable notes aren't lost to suppression.
+            groups = _orphaned_queued_notes(proj, sid)
+            if groups:
+                _emit_orphaned_queued_notes(groups)
+                printed = True
+            return
+        others = sum(1 for f in _prior_files(proj, sid)
+                     if f != path and classify(f)["interrupted"])
+        _emit_auto(path, info, others)
+        printed = True
+    finally:
+        _signal_done(sid, printed)
+
+
+def main():
+    # The SessionStart hook invokes this with NO arguments and hook JSON on stdin,
+    # so anything carrying arguments is the public `interrupted` CLI. An empty argv
+    # always stays hook mode -- that is what keeps the hook contract intact.
+    if len(sys.argv) > 1:
+        return _cli(sys.argv)
+    _run_auto()
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        # CLI mode: a real command must report a real failure, so nothing is
+        # swallowed here. The catch below is for the HOOK path only, where an
+        # unhandled traceback would land in the user's session start.
+        try:
+            sys.exit(main() or 0)
+        except BrokenPipeError:
+            # `interrupted | head` closes the pipe early. That is ordinary use of a
+            # paginated command, not a failure. os._exit skips the interpreter's
+            # exit-time flush, which would otherwise raise on the same dead pipe.
+            os._exit(0)
+        except KeyboardInterrupt:
+            os._exit(130)
+    else:
+        try:
+            main()
+        except Exception:
+            pass

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve this launcher through any symlink chain before deriving the
+# plugin root. This supports both Claude Code's plugin bin/ PATH entry
+# and development links such as ~/.local/bin/interrupted.
+SOURCE="${BASH_SOURCE[0]}"
+
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(
+    CDPATH= cd -P -- "$(dirname -- "$SOURCE")" &&
+    pwd -P
+  )"
+  LINK_TARGET="$(readlink "$SOURCE")"
+
+  if [[ "$LINK_TARGET" = /* ]]; then
+    SOURCE="$LINK_TARGET"
+  else
+    SOURCE="$SOURCE_DIR/$LINK_TARGET"
+  fi
+done
+
+SCRIPT_DIR="$(
+  CDPATH= cd -P -- "$(dirname -- "$SOURCE")" &&
+  pwd -P
+)"
+
+PLUGIN_ROOT="$(
+  CDPATH= cd -P -- "$SCRIPT_DIR/.." &&
+  pwd -P
+)"
+
+# The underlying Python file defaults to SessionStart-hook mode and waits
+# for hook JSON on stdin. The user-facing CLI defaults to browse mode.
+if (( $# == 0 )); then
+  set -- --list
+fi
+
+exec python3 \
+  "$PLUGIN_ROOT/hooks/detect-interrupted.py" \
+  "$@"

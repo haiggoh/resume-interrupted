@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.8.3] — 2026-11-15
+
+### Added — Phase 5 Wave C: committed portable package (COORDINATION C1/C2)
+
+- New `scripts/build-portable.py` (from the reviewed pilot pattern) generates the committed
+  `portable/` package: same-name manifest, the skill, the SessionStart detect hook, and the
+  bash launcher at `scripts/interrupted` (moved from `bin/`; it derives the plugin root as
+  `SCRIPT_DIR/..`, so the verbatim copy works from `scripts/`). The skill's PATH-guidance
+  sentences are rewritten for the portable layout (no `bin/` on PATH there). Emits
+  `portable/PORTABLE-BUILD.json` (haiggoh-portable-build/1) and a deterministic dist zip.
+- `tests/test_portable.py` pins freshness, same-name manifest, no `bin/`, the host->portable
+  set (byte-identical launcher move, rewritten skill lines), closure, C2 schema, zip, and a
+  functional check that the launcher prints its usage from the portable root.
+
 All notable changes to `resume-interrupted` are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
