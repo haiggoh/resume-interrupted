@@ -12,6 +12,7 @@ import os, sys, json, tempfile, subprocess, importlib.util, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "hooks", "detect-interrupted.py")
 spec = importlib.util.spec_from_file_location("detect", SCRIPT)
+assert spec is not None and spec.loader is not None
 detect = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(detect)
 
@@ -442,11 +443,13 @@ os.utime(KILLED, (1000, 1000))            # epoch 1000 = 1970
 
 r = detect.limit_constraint_stale(KILLED, now=_at(2026, 8, 14, 9, 6))
 check(r is not None and r["stale"] is True, "a kill many days ago -> stale (mtime fallback path)")
-check(r["source"] == "mtime", "no record timestamps -> source is reported as 'mtime', not blurred")
+check(r is not None and r["source"] == "mtime",
+      "no record timestamps -> source is reported as 'mtime', not blurred")
 
 fresh_file = session([U("build it"), A("working"), A(BUDGET)])
 now_ = _dt.datetime.now(UTC)
-check(detect.limit_constraint_stale(fresh_file, now=now_)["stale"] is False,
+r2 = detect.limit_constraint_stale(fresh_file, now=now_)
+check(r2 is not None and r2["stale"] is False,
       "a file written just now -> not stale (mtime fallback agrees with the event path)")
 
 # The case a naive date comparison gets WRONG: different calendar days, same reset period.
@@ -506,6 +509,7 @@ check("$" not in whole, "never prints a currency amount (no cap value is known o
 os.environ["RESUME_INTERRUPTED_RESET_UTC_HOUR"] = "8"
 os.environ["RESUME_INTERRUPTED_RESET_PROPAGATION_MIN"] = "0"
 spec2 = importlib.util.spec_from_file_location("detect_cfg", SCRIPT)
+assert spec2 is not None and spec2.loader is not None
 detect_cfg = importlib.util.module_from_spec(spec2)
 spec2.loader.exec_module(detect_cfg)
 check(detect_cfg.RESET_UTC_HOUR == 8 and detect_cfg.RESET_PROPAGATION_MIN == 0,
@@ -974,17 +978,19 @@ reg_entry("other.json", {"pid": MY_PID, "sessionId": "work", "startedAt": time.t
 d = proj_with([("work.jsonl", WORK, NOW - 3 * HOUR)])
 real_live = detect.session_live
 try:
-    detect.session_live = lambda sid, rd=None: False
+    # __dict__ assignment: pyright rejects direct attribute assignment on a ModuleType
+    # and ruff B010 rejects setattr with a constant name — __dict__ satisfies both.
+    detect.__dict__["session_live"] = lambda sid, rd=None: False
     out, _, _ = launch(["list", "--dir", d])
 finally:
-    detect.session_live = real_live
+    detect.__dict__["session_live"] = real_live
 check("RECOMMENDED" in out, "mutation: without the liveness check the live session IS listed (mechanism proven)")
 real_um = detect._unmatched_tool_use
 try:
-    detect._unmatched_tool_use = lambda recs: False
+    detect.__dict__["_unmatched_tool_use"] = lambda recs: False
     c = detect.classify(session([U("go"), A("working"), TOOL]))
 finally:
-    detect._unmatched_tool_use = real_um
+    detect.__dict__["_unmatched_tool_use"] = real_um
 check(not c["interrupted"] and c["reason"] != "mid-tool",
       "mutation: without the mid-tool check the shape reads as clean (mechanism proven)")
 os.environ["RESUME_INTERRUPTED_SESSIONS_DIR"] = REG
@@ -1268,7 +1274,7 @@ print("== branding: the recovery-offer context leads with the ⚡️ mark (plan 
 # The offer is a credit moment (the plugin just recovered a lost session); the all-clean note
 # is an idle surface and must stay unbranded. The user-visible box already carried the ⚡️
 # header upstream (line ~890, with the VS16 note); this pins the model-facing context string.
-_hooksrc = open(detect.__file__).read()
+_hooksrc = open(detect.__file__ or SCRIPT).read()
 check("⚡️ resume-interrupted: your most recent substantive session" in _hooksrc,
       "the offer context leads with '⚡️ resume-interrupted:'")
 check('ctx = ("resume-interrupted: your most recent substantive session' not in _hooksrc,

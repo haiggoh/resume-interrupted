@@ -64,14 +64,14 @@
     }
   ],
   "files": {
-    ".claude-plugin/plugin.json": "e2febc9d93e98200282bef26a9fceae15d6b9b6054d3ad49a6f3e92c886b6cf1",
-    "hooks/detect-interrupted.py": "fb5fc0af710b38b6e86e49757a68baeb68cbf919a0618bdf4cdb418bddd16925",
+    ".claude-plugin/plugin.json": "dadf5ecbd450472d9ce03a566d39b961d80f8ed0d33d3fcc0fd439db6d36d32c",
+    "hooks/detect-interrupted.py": "7bbe38f45bdec381d2f827f222f9896fc8eddd7d94ea6b0d031cb10c32158b24",
     "hooks/hooks.json": "4e63cc82c4f718654582de28f2302138a12966acb2a9497152a6ea4e1ae8100c",
     "scripts/interrupted": "bfc69282a607b47a960207988b8c2f745f051bb0f6664da8c5df9d3fc82dcd37",
     "skills/resume-interrupted/SKILL.md": "5cdd3e9eca6c6c2f5e06b7d83df25f9b1c76e4495ba5a519ed71c654df173d84"
   },
   "schema": "haiggoh-portable-build/1",
-  "source_commit": "753e20ff399c308e48d4ec29205fab29d10b3b45",
+  "source_commit": "c98d6329628f1f47e203abed4e027547e212de19",
   "source_repo": "haiggoh/resume-interrupted",
   "transform_version": "1"
 }

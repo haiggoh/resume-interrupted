@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.8.5] — 2026-11-16
+
+### Fixed — pyright clean (0 errors repo-wide)
+
+- `hooks/detect-interrupted.py`: the `extra` dict in `_collect_rows` is now annotated
+  `dict[str, object]` (bool + str values no longer trip reportArgumentType);
+  removed dead `_run_list` (nothing referenced it; the CLI owns `--list`).
+- `tests/test_detect.py`: assert the `ModuleSpec`/loader are present before
+  `module_from_spec`/`exec_module`; narrow the optional `limit_constraint_stale`
+  result inside each check; monkeypatch via `__dict__` (pyright rejects attribute
+  assignment on ModuleType, ruff B010 rejects constant-name `setattr`);
+  `open(detect.__file__ or SCRIPT)`.
+- `portable/` rebuilt (build-portable.py) so the shipped copy is byte-current.
+- Gates: pyright 0 errors (pytest venv pythonpath), test_detect 269/269 (twice),
+  test_shortcuts PASS, test_portable 8/8.
+
 ## [0.8.4] — 2026-11-16
 
 ### Fixed — a terminal API-error kill now outranks the live-registry filter

@@ -1,6 +1,6 @@
 {
   "name": "resume-interrupted",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "description": "\u26a1\ufe0f Detects when your most recent session in a project was cut off mid-task \u2014 a crash, a dropped connection or a usage limit \u2014 and offers at startup to pick up where you left off. It never offers a session that is still running, tells you whether a limit that stopped you has reset, and recovers the context from the transcript. The `interrupted` command lists and reviews unfinished sessions.",
   "author": {
     "name": "Heiko Brantsch"

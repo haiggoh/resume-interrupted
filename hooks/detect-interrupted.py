@@ -1279,7 +1279,7 @@ def _collect_rows(proj, all_projects=False, mtime_floor=None):
                 continue  # a LIVE session is not an interrupted one — unless its transcript
                 # ended in a terminal API error, which proves the session dead (kill wins)
             if info["interrupted"]:
-                extra = {"may_be_running": _maybe_running(f, reg_ok)}
+                extra: dict[str, object] = {"may_be_running": _maybe_running(f, reg_ok)}
                 if all_projects:
                     extra["project"] = os.path.basename(pdir)
                     extra["title"] = _session_title(f)
@@ -1754,12 +1754,6 @@ def _cli(argv):
                  "so one session is shown anyway.)" % opts["max_chars"])
     print(text)
     return 0
-
-
-def _run_list(argv):
-    """Retained entry point for --list. The CLI supersedes it; kept so anything
-    calling it directly keeps working."""
-    return _cli(argv)
 
 
 def _banner_flag_dir():
