@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.8.4] — 2026-11-16
+
+### Fixed — a terminal API-error kill now outranks the live-registry filter
+
+- The detector checked `session_live()` before `classify()`, so a session whose transcript
+  *ends* in a terminal API error (limit-kill / api-error / connection-drop) was hidden
+  whenever its launcher process still answered `kill(0)` (ps state `Ss+`) — measured
+  2026-11-16: two budget-killed sessions (pids 9233/6594) never appeared in
+  `interrupted list` / `recommended` / the SessionStart offer. Now `classify()` runs first
+  and the registry only filters *ambiguous* tails (stalled / mid-tool / between-turns /
+  clean), so a live, progressing session is still never a candidate. `tail` no longer prints
+  "LIVE session -- do not double-drive" for a killed session; it says the registry process
+  is alive but the transcript ended in a terminal API error (`registry_live` in `--json`).
+- Recency within the actually-interrupted set is unchanged (newest first, first substantive
+  non-may-running row is recommended) and now actually reachable for kills.
+
+### Added — suggestion mode follows the invoking directory
+
+- `interrupted` / `interrupted recommended` now print a `mode:` line (also a `mode` field in
+  `--json`). Invoked from inside a repo checkout: *project-scoped*, preferring the same
+  repo's project folder (resolved via the git toplevel, so a subdir cwd still lands on the
+  repo's transcripts). Invoked from home or any non-repo folder: *all projects*.
+  `--project`/`--dir`/`--all-projects` override explicitly.
+
+### Changed — the skill's routine now offers candidates via AskUserQuestion
+
+- SKILL.md: when the listing holds several plausible candidates, offer them with
+  AskUserQuestion (recommended row first, labelled "(Recommended)", plus the next few
+  substantive `[work]` rows; description = project + reason + dangling prompt), and state the
+  applied mode to the user. Documents the kill-outranks-registry liveness rule.
+
+- Tests: `tests/test_detect.py` v0.8.4 section (kill-vs-live-pid precedence, ambiguous-tail
+  guard, recency, mode selection from repo vs non-repo cwd, SKILL.md pins). 269/269.
+
 ## [0.8.3] — 2026-11-15
 
 ### Added — Phase 5 Wave C: committed portable package (COORDINATION C1/C2)

@@ -118,6 +118,19 @@ MAYBE_RUNNING_S = 600                 # no registry answered: a session written 
 START_MATCH_TOLERANCE_MS = 120_000    # ps-elapsed vs startedAt slack (clock rounding, ps sampling)
 _registry_warned = {"done": False}
 
+# A terminal error turn in the transcript is positive evidence the SESSION is dead, and it
+# OUTRANKS the registry: a budget kill ends the API session while the launcher process can
+# stay alive (ps state Ss+) long afterwards, so registry liveness alone would hide real kills
+# (measured 2026-11-16: pids 9233/6594 alive, transcripts ended in the 422 budget kill).
+# The registry decides only AMBIGUOUS tails (stalled / mid-tool / between-turns / clean),
+# where a live, progressing session must never be offered as a resume candidate.
+_ERROR_KILL_REASONS = ("limit-kill", "api-error", "connection-drop")
+
+
+def _terminal_kill(info):
+    """True when classify() saw the session die on a terminal API-error turn (E)."""
+    return bool(info.get("interrupted")) and info.get("reason") in _ERROR_KILL_REASONS
+
 
 def _registry_dir():
     """(dir, error) for the live-session registry. RESUME_INTERRUPTED_SESSIONS_DIR overrides
@@ -749,12 +762,14 @@ def _recommended(proj, current_sid):
     """Auto-mode candidate: the most recent SUBSTANTIVE session, iff it was interrupted.
     A clean substantive session (you moved on) suppresses; a killed/empty one is skipped
     so the offer re-appears; a LIVE session (registry says its process is running) is never
-    a candidate, and neither is one that may still be running (no registry answered and the
-    transcript is fresh). Returns (path, info) or (None, None)."""
+    a candidate — UNLESS the transcript itself ended in a terminal API error, which proves
+    the session dead even while the process lingers — and neither is one that may still be
+    running (no registry answered and the transcript is fresh). Returns (path, info) or
+    (None, None)."""
     for f in _prior_files(proj, current_sid):
-        if session_live(_sid_of(f)):
-            continue
         info = classify(f)
+        if session_live(_sid_of(f)) and not _terminal_kill(info):
+            continue
         if not info["has_work"]:
             continue
         if _maybe_running(f, _registry_ok()):
@@ -831,9 +846,10 @@ def _orphaned_queued_notes(proj, current_sid):
     cutoff = time.time() - ORPHANED_NOTE_WINDOW_S
     out = []
     for f in files[:top_idx]:  # newer than the clean top, newest-first
-        if session_live(_sid_of(f)):
-            continue  # a live probe session is not a dead-end retry; its notes may still land
         info = classify(f)
+        if session_live(_sid_of(f)) and not _terminal_kill(info):
+            continue  # a live probe session is not a dead-end retry; its notes may still land
+            # (a probe whose transcript ended in a terminal API error IS dead — kill wins)
         if info["has_work"]:
             break  # real work happened after the probes -> not this function's to reach past
         try:
@@ -993,6 +1009,39 @@ def _project_dir_from_cwd():
     return os.path.join(_projects_root(), _encode_project_path(os.getcwd()))
 
 
+def _git_toplevel(path):
+    """The git work-tree root containing `path`, or None. Never reads argv; fails closed."""
+    try:
+        p = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    top = (p.stdout or "").strip()
+    return os.path.realpath(top) if top else None
+
+
+def _suggest_mode():
+    """(mode, project_dir_or_None, label) — where a resume suggestion looks by default.
+
+    Invoked from inside a repo checkout: project-scoped — prefer sessions from the SAME
+    repo's project folder (the encoded folder of the git toplevel, so a subdir cwd still
+    lands on the repo's own transcripts). Invoked from home or any folder not inside a
+    repo: all projects — home is where cross-repo work happens, and the home project
+    folder alone would hide every other repo's interruptions. --project/--dir/--all-projects
+    override this auto mode explicitly.
+    """
+    cwd = os.getcwd()
+    top = _git_toplevel(cwd)
+    home = os.path.realpath(os.path.expanduser("~"))
+    if top and top != home:
+        return ("project", os.path.join(_projects_root(), _encode_project_path(top)),
+                "project-scoped (%s)" % top)
+    return ("all", None,
+            "all projects (%s is not inside a repo)" % cwd)
+
+
 def _all_project_dirs():
     """Every project transcript directory under the projects root, for --all-projects."""
     root = _projects_root()
@@ -1056,7 +1105,17 @@ TAIL_CHARS_DEFAULT = 240
 AUDIT_DIGEST_MAX_CHARS = 6000
 AUDIT_SCAN_TIMEOUT_S = 60
 
-CLI_USAGE = """interrupted -- list the sessions in this project that were cut off mid-task.
+CLI_USAGE = """interrupted -- list the sessions that were cut off mid-task.
+
+Where it looks (the mode is printed on the first output line as "mode: ..."):
+  invoked from inside a repo checkout -> project-scoped: sessions from the same repo's
+      project folder first (the git toplevel's transcripts, so a subdir cwd still lands
+      on the repo's own). Invoked from home or any folder not inside a repo -> ALL
+      projects. --project/--dir pin one project explicitly; --all-projects forces all.
+  A session whose transcript ENDS in a terminal API error (limit-kill / api-error /
+  connection-drop) is dead even if its launcher process still shows alive in the
+  registry — the kill outranks the registry. The registry only filters ambiguous
+  tails, so a live, progressing session is never offered.
 
 Usage:
   interrupted                        list interrupted sessions, newest first
@@ -1091,7 +1150,7 @@ Options:
                    list/recommended; each row is labelled with its project folder.
                    Bounded to the last 14 days of writes (classify parses whole
                    transcripts; RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S seconds
-                   overrides, 0 disables).
+                   overrides, 0 disables). Default when invoked outside any repo.
   --json           complete machine-readable output. Never paginated.
   -h, --help       this text.
 
@@ -1215,9 +1274,10 @@ def _collect_rows(proj, all_projects=False, mtime_floor=None):
             # SYMLINK sits at project level (the link path itself names no subagents part)
             if mtime_floor and os.path.getmtime(f) < mtime_floor:
                 continue  # outside the recency window — not a recovery target
-            if session_live(_sid_of(f)):
-                continue  # a LIVE session is not an interrupted one, whatever its tail
             info = classify(f)
+            if session_live(_sid_of(f)) and not _terminal_kill(info):
+                continue  # a LIVE session is not an interrupted one — unless its transcript
+                # ended in a terminal API error, which proves the session dead (kill wins)
             if info["interrupted"]:
                 extra = {"may_be_running": _maybe_running(f, reg_ok)}
                 if all_projects:
@@ -1508,7 +1568,8 @@ def _run_tail(opts):
         raise _CliError("%s has no readable records" % path)
     sid = _sid_of(path)
     info = classify(path)
-    live = session_live(sid)
+    reg_live = session_live(sid)
+    live = reg_live and not _terminal_kill(info)
     queue_texts = {_norm(o.get("content") or "")[:60] for o in recs
                    if o.get("type") == "queue-operation"}
     queued = [{"text": _norm(q), "source": "queue-operation" if _norm(q)[:60] in queue_texts
@@ -1526,6 +1587,7 @@ def _run_tail(opts):
         print(json.dumps({
             "path": path, "session_id": sid, "records_total": len(recs),
             "interrupted": info["interrupted"], "reason": info["reason"], "live": bool(live),
+            "registry_live": bool(reg_live),
             "dangling": _norm(info["dangling"]), "queued": queued,
             "unanswered_tool_use": unanswered, "reset_check": reset, "records": rows,
             "audit": audit}))
@@ -1536,7 +1598,9 @@ def _run_tail(opts):
            "verdict     %s%s%s" % (
                ("interrupted: " + info["reason"]) if info["interrupted"] else "not interrupted",
                "" if info["has_work"] else " (no substantive work)",
-               "   LIVE session -- do not double-drive" if live else "")]
+               "   LIVE session -- do not double-drive" if live else
+               ("   registry process alive, but the transcript ended in a terminal API error"
+                " — the session is dead" if reg_live else ""))]
     if info["dangling"]:
         out.append("dangling    \"%s\"" % _clip(info["dangling"], opts["chars"]))
     out.append("")
@@ -1591,6 +1655,17 @@ def _cli(argv):
             return 2
 
     all_projects = opts["all_projects"]
+    mode_label = None
+    auto_proj = None
+    if opts.get("project") or opts.get("dir"):
+        mode_label = "project (explicit --project/--dir)"
+    elif all_projects:
+        mode_label = "all projects (--all-projects)"
+    else:
+        mode, auto_proj, label = _suggest_mode()
+        mode_label = "auto — " + label
+        if mode == "all":
+            all_projects = True
     if all_projects:
         root = _projects_root()
         if os.environ.get("RESUME_INTERRUPTED_PROJECTS_ROOT") and not os.path.isdir(root):
@@ -1605,12 +1680,17 @@ def _cli(argv):
         rows, rec_path = _collect_rows(None, all_projects=True, mtime_floor=mtime_floor)
         proj = root
     else:
-        proj = _resolve_project_dir(opts)
+        proj = _resolve_project_dir(opts) if (opts.get("project") or opts.get("dir")) else auto_proj
+        if proj is None:  # unreachable in practice (mode "all" flips all_projects above); fail loud, never guess
+            sys.stderr.write("interrupted: could not resolve a project directory for this mode\n")
+            return 2
         if not os.path.isdir(proj):
             if opts["json"]:
                 print(json.dumps({"project_dir": proj, "total": 0, "items": [],
-                                  "error": "no such project transcript directory"}))
+                                  "error": "no such project transcript directory",
+                                  "mode": mode_label}))
             else:
+                print("mode: %s" % mode_label)
                 print("No project transcript directory found (%s)." % proj)
             return 0
         rows, rec_path = _collect_rows(proj)
@@ -1618,24 +1698,27 @@ def _cli(argv):
     if opts["cmd"] == "recommended":
         rec = [(f, i) for f, i in rows if f == rec_path]
         if opts["json"]:
-            print(json.dumps({"project_dir": proj,
+            print(json.dumps({"project_dir": proj, "mode": mode_label,
                               "recommended": _row_json(rec[0][0], rec[0][1], rec_path)
                               if rec else None}))
-        elif rec:
-            print(_render_row(rec[0][0], rec[0][1], rec_path))
         else:
-            print("No interrupted session with substantive work across all project folders."
-                  if all_projects
-                  else "No interrupted session with substantive work in this project.")
+            print("mode: %s" % mode_label)
+            if rec:
+                print(_render_row(rec[0][0], rec[0][1], rec_path))
+            else:
+                print("No interrupted session with substantive work across all project folders."
+                      if all_projects
+                      else "No interrupted session with substantive work in this project.")
         return 0
 
     if opts["json"]:
         # Never paginated: the JSON contract is the complete set.
-        print(json.dumps({"project_dir": proj, "total": len(rows),
+        print(json.dumps({"project_dir": proj, "mode": mode_label, "total": len(rows),
                           "items": [_row_json(f, i, rec_path) for f, i in rows]}))
         return 0
 
     if not rows:
+        print("mode: %s" % mode_label)
         print("No interrupted sessions found across all project folders." if all_projects
               else "No interrupted sessions found in this project.")
         return 0
@@ -1653,7 +1736,8 @@ def _cli(argv):
         print("Page %d is past the end (%d session(s) total)." % (opts["page"], len(rows)))
         return 0
 
-    parts = [LIST_HEADER_CROSS if all_projects else LIST_HEADER]
+    parts = ["mode: %s" % mode_label,
+             LIST_HEADER_CROSS if all_projects else LIST_HEADER]
     parts.extend(shown)
     if start or has_more:
         parts.append("\n  Showing %d-%d of %d." % (start + 1, start + len(shown), len(rows)))

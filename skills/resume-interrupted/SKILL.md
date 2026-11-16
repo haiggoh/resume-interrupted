@@ -132,7 +132,9 @@ is exactly where the two can disagree and turn a correct verdict into a wrong on
    one, each resumes its OWN named target — never all racing to the same latest one.
    Unnamed, pick the most recent **substantive** session (has real assistant work); if it
    ended cleanly, the user has moved on; if it matches an interrupted verdict — (E), (M), (T)
-   or (S) — it's the one.
+   or (S) — it's the one. When the listing holds several plausible candidates, **offer them
+   with AskUserQuestion — routine, not optional** (details in the listing section below):
+   recommended row first, labelled "(Recommended)", plus the next few `[work]` rows.
    **Shortcut for steps 3–4: `interrupted tail <session-id-or-path>`.** Read-only. It prints the
    detector's verdict, the last conversational records condensed (tool calls and results
    included, errors flagged), every unanswered prompt (`queue-operation` records tagged as
@@ -223,7 +225,22 @@ you have one.)
 > ```
 
 It prints every interrupted session, most recent first, and marks the most likely resume
-candidate with `>`. Present it as a short table and ask which one to jump back into.
+candidate with `>`.
+
+**Say the mode out loud:** the first output line is `mode: ...` — invoked from inside a repo
+checkout it is *project-scoped* (same repo's project folder preferred, via the git toplevel,
+so a subdir cwd still lands on the repo's own transcripts); from home or any non-repo folder
+it scans *all projects*. `--project`/`--dir` pin one project, `--all-projects` forces all.
+
+**Liveness:** a transcript ending in a terminal API error (limit-kill/api-error/
+connection-drop) is dead even if its launcher pid still shows alive in `~/.claude/sessions` —
+the kill outranks the registry; the registry only filters ambiguous tails, so a live,
+progressing session is never offered.
+
+**Offer the candidates with AskUserQuestion — routine, not optional:** the `>` row first,
+labelled "(Recommended)", plus the next up to three substantive `[work]` rows; each option's
+description = project + reason + dangling prompt. Probes stay prose. Recency wins within the
+mode once live sessions are filtered out. Resume the chosen one.
 
 **Probe transparency:** sessions whose only content is a single unanswered prompt are
 labelled `[probe]` (usually a failed "are we back yet?" availability check). They're the

@@ -865,10 +865,15 @@ check(r.stdout.strip() == "False", "and liveness answers False on no positive ev
 os.environ["RESUME_INTERRUPTED_SESSIONS_DIR"] = REG
 
 print("== v0.6.0: live sessions are excluded from the listing and the recommendation ==")
-d = proj_with([("work.jsonl", WORK, NOW - 3 * HOUR)])
+# An AMBIGUOUS tail (stall, no terminal error turn) + a live registry pid -> excluded.
+# (A terminal API-error kill + live pid is NOT excluded — that precedence is the v0.8.4
+# change and is pinned in the v0.8.4 section below; WORK ends in an error turn, so it is
+# a kill fixture and no longer belongs here.)
+LIVE_WORK = [U("build the thing"), A("starting"), U("one more step?"), LP("one more step?")]
+d = proj_with([("work.jsonl", LIVE_WORK, NOW - 3 * HOUR)])
 reg_entry("other.json", {"pid": MY_PID, "sessionId": "work", "startedAt": time.time() * 1000})
 out, err, rc = launch(["list", "--dir", d])
-check(out.strip() == "" or "work" not in out, "a LIVE work session is not listed as interrupted")
+check("stalled" not in out, "a LIVE work session (ambiguous tail) is not listed as interrupted")
 out, _, _ = launch(["recommended", "--dir", d])
 check("No interrupted session" in out, "a LIVE session is not recommended for resume")
 # Same transcript, dead pid -> listed again (the registry decides, nothing else changed).
@@ -1271,6 +1276,79 @@ check('ctx = ("resume-interrupted: your most recent substantive session' not in 
 # note uses uppercase SUBSTANTIVE and must keep matching its own unbranded line.
 check('ctx = ("resume-interrupted: your most recent SUBSTANTIVE session was clean' in _hooksrc,
       "the all-clean note stays unbranded (idle surface)")
+
+print("\n== v0.8.4: a terminal API-error kill outranks a live registry pid ==")
+os.environ["RESUME_INTERRUPTED_SESSIONS_DIR"] = REG
+KILL = [U("do it"), A("working"), AS_(KILL429, 429), LP("do it")]
+STALL = [U("do it"), A("working"), U("ping?"), LP("ping?")]
+d = proj_with([("killed.jsonl", KILL, NOW - HOUR)])
+reg_entry("k.json", {"pid": MY_PID, "sessionId": "killed", "startedAt": time.time() * 1000})
+out, _, _ = launch(["list", "--dir", d])
+check("limit-kill" in out and "RECOMMENDED" in out,
+      "terminal limit-kill with a LIVE registry pid is still listed and recommended")
+out, _, _ = launch(["recommended", "--dir", d])
+check("limit-kill" in out and "do it" in out,
+      "`recommended` returns the killed session despite the live pid")
+out, _, _ = launch(["tail", "killed", "--dir", d, "--no-audit"])
+check("do not double-drive" not in out and "terminal API error" in out,
+      "tail does not call a killed session LIVE; it notes registry-alive + terminal error")
+out, _, _ = launch(["tail", "killed", "--dir", d, "--no-audit", "--json"])
+j = json.loads(out)
+check(j["live"] is False and j["registry_live"] is True,
+      "tail --json: live=false but registry_live=true on a killed session")
+# Guard: an ambiguous tail + live pid is STILL excluded — the registry yields only to an (E) death.
+d2 = proj_with([("stalled.jsonl", STALL, NOW - HOUR)])
+reg_entry("s.json", {"pid": MY_PID, "sessionId": "stalled", "startedAt": time.time() * 1000})
+out, _, _ = launch(["list", "--dir", d2])
+check("stalled" not in out, "stalled tail + live pid is still NOT a candidate (registry wins on ambiguous tails)")
+clear_reg()
+
+print("\n== v0.8.4: recency wins among actually-interrupted sessions ==")
+d3 = proj_with([("old-kill.jsonl", KILL, NOW - 5 * HOUR),
+               ("new-stall.jsonl", STALL, NOW - HOUR)])
+out, _, _ = launch(["recommended", "--dir", d3])
+check("stalled" in out and "ping?" in out,
+      "recommended = the NEWEST interrupted session (the stall), not the older kill")
+out, _, _ = launch(["list", "--dir", d3])
+check(out.index("ping?") < out.index("do it"), "list is newest-first")
+
+print("\n== v0.8.4: suggestion mode follows the invoking directory ==")
+ROOT3 = tempfile.mkdtemp()
+os.environ["RESUME_INTERRUPTED_PROJECTS_ROOT"] = ROOT3
+repo = os.path.realpath(tempfile.mkdtemp())
+subprocess.run(["git", "init", "-q", repo], check=True)
+enc_repo = os.path.join(ROOT3, detect._encode_project_path(repo))
+os.makedirs(enc_repo)
+with open(os.path.join(enc_repo, "repo-kill.jsonl"), "w") as fh:
+    for r in KILL:
+        fh.write(json.dumps(r) + "\n")
+os.utime(os.path.join(enc_repo, "repo-kill.jsonl"), (NOW - HOUR, NOW - HOUR))
+enc_other = os.path.join(ROOT3, "-someone-else")
+os.makedirs(enc_other)
+with open(os.path.join(enc_other, "other-stall.jsonl"), "w") as fh:
+    for r in STALL:
+        fh.write(json.dumps(r) + "\n")
+os.utime(os.path.join(enc_other, "other-stall.jsonl"), (NOW - 30 * 60, NOW - 30 * 60))
+out, _, _ = launch(["recommended"], cwd=repo)
+check(out.startswith("mode:"), "the mode line is the first output line")
+check("project-scoped" in out and "limit-kill" in out and "someone-else" not in out,
+      "invoked from a repo: project-scoped mode, same-repo session suggested, mode printed")
+nonrepo = tempfile.mkdtemp()
+out, _, _ = launch(["recommended"], cwd=nonrepo)
+check("all projects" in out and "ping?" in out and "someone-else" in out,
+      "invoked from a non-repo folder: all-projects mode, newest across projects wins")
+out, _, _ = launch(["recommended", "--json"], cwd=nonrepo)
+check(json.loads(out).get("mode", "").startswith("auto"), "--json carries the mode field")
+if ROOT_SAVE is None:
+    os.environ.pop("RESUME_INTERRUPTED_PROJECTS_ROOT", None)
+else:
+    os.environ["RESUME_INTERRUPTED_PROJECTS_ROOT"] = ROOT_SAVE
+
+print("\n== v0.8.4: SKILL.md routine offers candidates via AskUserQuestion and names both modes ==")
+skill_md = open(os.path.join(HERE, "..", "skills", "resume-interrupted", "SKILL.md")).read()
+check("AskUserQuestion" in skill_md, "SKILL.md makes the candidate picker a routine step")
+check("project-scoped" in skill_md and "all projects" in skill_md,
+      "SKILL.md documents both suggestion modes and that the mode is surfaced")
 
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
