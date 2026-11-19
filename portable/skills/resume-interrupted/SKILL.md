@@ -1,6 +1,7 @@
 ---
 name: resume-interrupted
 description: Use when a session may have been cut off mid-task — when the user says "continue", "pick up where we left off", "did that finish?", asks to list/see which past sessions were interrupted or left unfinished, or a SessionStart notice reports an interrupted prior session, or the general sentiment implies unfinished business from a recent session. Recovers context from the transcript and continues the interrupted work.
+argument-hint: "[session-id | transcript path | window title]"
 ---
 
 # Resume interrupted work
@@ -9,6 +10,32 @@ A session can die at any moment — a usage/credit limit, a crash, a dropped con
 When it does, **no compute happens afterward**, so nothing records that the work was
 unfinished. The interruption leaves no note in memory; the only trace is the transcript
 itself. This skill recovers that context and continues.
+
+## Targeted invocation — an argument names the session (check this FIRST)
+
+Invocation arguments: `$ARGUMENTS`
+
+If that line holds anything (or the user's message names a session: a full or partial
+session id, a `.jsonl` path, a pasted `ID: …` row, or a "📡 <model> · <xx>" window title),
+**that is the target, and the rest of the routine below is skipped**:
+
+- **Do NOT run `interrupted` / `interrupted recommended` and do NOT offer AskUserQuestion
+  candidates.** The user already picked one. A newer or "recommended" session is irrelevant,
+  and so is a skill suggestion from another plugin or hook. Resuming a different session
+  than the one named is the failure this section exists to prevent.
+- An id or path → run exactly `interrupted tail <id-or-path>` (add `--records 40` to widen).
+  A bare id is looked up in the current project's folder, then in every project folder, so
+  you need **no** `--project`. If it reports `ambiguous`, ask the user which one.
+  Report the verdict and resume, even if it says `not interrupted`: the user asked for THIS
+  session, and a clean verdict can still leave loose ends.
+- A window title → it is not an id. Find the session by content (see "A session the user names
+  by its window title" below), confirm the full id, then `interrupted tail <full-id>`.
+- Then go to step 4 of the recovery procedure (reconstruct intent) with that transcript.
+
+**CLI shape:** `interrupted [list|recommended|tail SESSION] [options]`. Options may come
+before or after the subcommand. An `unknown argument` error means an **old installed copy**
+(≤ 0.8.5, subcommand only first): put the subcommand first, e.g.
+`interrupted tail <id> --project <path>`, and do not go looking for another binary.
 
 ## When this fires
 

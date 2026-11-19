@@ -1127,8 +1127,14 @@ Usage:
                                      records included), unanswered tool calls, the detector's
                                      verdict, a reset-boundary check, and -- when the
                                      audit-loose-ends plugin is installed -- its digest.
-                                     SESSION is a transcript path or a session-id prefix
-                                     (looked up in the project directory).
+                                     SESSION is a transcript path or a session-id prefix:
+                                     looked up in the current project's folder, then in
+                                     EVERY project folder (a session id is unique). An
+                                     explicit --project/--dir pins the lookup to that one
+                                     folder; --all-projects skips straight to all of them.
+
+Options and the subcommand may come in any order:
+  `interrupted --project P tail ID` == `interrupted tail ID --project P`.
 
 Options:
   --records N      tail: how many trailing conversational records to show (default %d).
@@ -1147,7 +1153,8 @@ Options:
                    redirection; may exceed what Claude Code shows inline.
   --all-projects   scan every project folder under ~/.claude/projects (or
                    RESUME_INTERRUPTED_PROJECTS_ROOT), not just this one. Works with
-                   list/recommended; each row is labelled with its project folder.
+                   list/recommended (each row is labelled with its project folder)
+                   and tail (find SESSION in any folder).
                    Bounded to the last 14 days of writes (classify parses whole
                    transcripts; RESUME_INTERRUPTED_ALL_PROJECTS_WINDOW_S seconds
                    overrides, 0 disables). Default when invoked outside any repo.
@@ -1199,8 +1206,10 @@ def _parse_cli(argv):
             "all_projects": False,
             "target": None, "records": TAIL_RECORDS_DEFAULT, "chars": TAIL_CHARS_DEFAULT,
             "no_audit": False}
-    if args and args[0] in ("list", "recommended", "tail", "help"):
-        opts["cmd"] = args.pop(0)
+    # The subcommand may sit anywhere, not only first: `interrupted --project P tail ID`
+    # failed with "unknown argument tail" (2026-11-18) because the skill teaches options
+    # first. A valued option consumes its value below, so `--project tail` is never misread.
+    subcommands = ("list", "recommended", "tail", "help")
     valued = {"--project": "project", "--dir": "dir", "--limit": "limit",
               "--page": "page", "--max-chars": "max_chars",
               "--records": "records", "--chars": "chars"}
@@ -1223,6 +1232,8 @@ def _parse_cli(argv):
             opts[key] = v
         elif a == "--no-audit":
             opts["no_audit"] = True
+        elif a in subcommands and opts["cmd"] is None:
+            opts["cmd"] = a
         elif opts["cmd"] == "tail" and not a.startswith("-") and opts["target"] is None:
             opts["target"] = a
         elif a == "--list":
@@ -1457,7 +1468,8 @@ def _tail_records(recs, count, n):
 
 
 def _resolve_tail_target(opts):
-    """A transcript path, or a session-id prefix looked up in the project directory."""
+    """A transcript path, or a session-id prefix: the cwd's project folder first, then every
+    project folder. An explicit --project/--dir is strict (never widened)."""
     target = opts["target"]
     if not target:
         raise _CliError("tail needs a session: a transcript path or a session-id prefix "
@@ -1466,16 +1478,31 @@ def _resolve_tail_target(opts):
         return target
     if os.sep in target or target.endswith(".jsonl"):
         raise _CliError("no such transcript: %s" % target)
-    proj = _resolve_project_dir(opts)
-    if not os.path.isdir(proj):
-        raise _CliError("no session %r: project transcript directory %s does not exist"
-                        % (target, proj))
-    hits = sorted(f for f in glob.glob(os.path.join(proj, target + "*.jsonl")))
+    explicit = bool(opts.get("project") or opts.get("dir"))
+    if not opts.get("all_projects"):
+        proj = _resolve_project_dir(opts)
+        if explicit and not os.path.isdir(proj):
+            raise _CliError("no session %r: project transcript directory %s does not exist"
+                            % (target, proj))
+        hits = sorted(glob.glob(os.path.join(proj, target + "*.jsonl"))) if os.path.isdir(proj) else []
+        if len(hits) > 1:
+            raise _CliError("%r is ambiguous in %s: %s" % (
+                target, proj, ", ".join(os.path.basename(h)[:12] for h in hits[:6])))
+        if hits:
+            return hits[0]
+        if explicit:  # a pinned project is an instruction: never widen it silently
+            raise _CliError("no transcript starting with %r in %s" % (target, proj))
+    # A session id is unique across every project folder, so an unpinned lookup that misses
+    # the cwd's folder searches them all (a targeted resume from another cwd, 2026-11-18).
+    root = _projects_root()
+    hits = sorted(h for d in _all_project_dirs()
+                  for h in glob.glob(os.path.join(d, target + "*.jsonl")))
     if not hits:
-        raise _CliError("no transcript starting with %r in %s" % (target, proj))
+        raise _CliError("no transcript starting with %r in any project folder under %s"
+                        % (target, root))
     if len(hits) > 1:
-        raise _CliError("%r is ambiguous in %s: %s" % (
-            target, proj, ", ".join(os.path.basename(h)[:12] for h in hits[:6])))
+        raise _CliError("%r is ambiguous across project folders: %s" % (
+            target, ", ".join(os.path.relpath(h, root)[:60] for h in hits[:6])))
     return hits[0]
 
 

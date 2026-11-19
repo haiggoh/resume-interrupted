@@ -1356,5 +1356,61 @@ check("AskUserQuestion" in skill_md, "SKILL.md makes the candidate picker a rout
 check("project-scoped" in skill_md and "all projects" in skill_md,
       "SKILL.md documents both suggestion modes and that the mode is surfaced")
 
+print("\n== v0.8.6: subcommand anywhere + tail finds a session id in ANY project ==")
+# Real failure 2026-11-18: `interrupted --project P tail <id>` -> "unknown argument tail".
+ROOT4 = tempfile.mkdtemp()
+pd_a = os.path.join(ROOT4, "-proj-a")
+pd_b = os.path.join(ROOT4, "-proj-b")
+for p in (pd_a, pd_b):
+    os.makedirs(p)
+with open(os.path.join(pd_b, "de1e6828-bbbb.jsonl"), "w") as fh:
+    for r in TAIL_RECS:
+        fh.write(json.dumps(r) + "\n")
+with open(os.path.join(pd_a, "feed0001-aaaa.jsonl"), "w") as fh:
+    for r in TAIL_RECS:
+        fh.write(json.dumps(r) + "\n")
+os.environ["RESUME_INTERRUPTED_PROJECTS_ROOT"] = ROOT4
+try:
+    out, err, code = launch(["--dir", pd_b, "tail", "de1e6828", "--no-audit"])
+    check(code == 0 and "step one done" in out,
+          "options BEFORE the subcommand work: --dir D tail ID (stderr: %s)" % err.strip()[:80])
+    out, err, code = launch(["--no-audit", "recommended", "--dir", pd_b])
+    check(code == 0 and "unknown argument" not in err, "a flag before `recommended` is accepted")
+    _, err, code = launch(["--dir", pd_b, "tail"])
+    check(code == 2 and "tail needs a session" in err,
+          "a late `tail` with no target is still the tail usage error, not 'unknown argument'")
+    _, err, code = launch(["list", "tail"])
+    check(code == 2 and "unknown argument tail" in err,
+          "a second subcommand word is still a loud error")
+    # A full id from another project resolves with no --project (cwd's folder has no match).
+    elsewhere = tempfile.mkdtemp()
+    out, err, code = launch(["tail", "de1e6828-bbbb", "--no-audit"], cwd=elsewhere)
+    check(code == 0 and "step one done" in out and "-proj-b" in out,
+          "tail <id> falls back to every project folder when cwd's has no match (stderr: %s)"
+          % err.strip()[:80])
+    _, err, code = launch(["tail", "de1e6828", "--dir", pd_a, "--no-audit"])
+    check(code == 2 and "de1e6828" in err,
+          "an EXPLICIT --dir stays strict: no silent fallback to other projects")
+    with open(os.path.join(pd_a, "de1e6828-cccc.jsonl"), "w") as fh:
+        fh.write(json.dumps(U("x")) + "\n")
+    _, err, code = launch(["tail", "de1e6828", "--no-audit"], cwd=elsewhere)
+    check(code == 2 and "ambiguous" in err,
+          "a prefix matching in two projects is ambiguous, never a guess")
+    out, err, code = launch(["tail", "feed0001", "--all-projects", "--no-audit"], cwd=elsewhere)
+    check(code == 0 and "step one done" in out, "tail accepts --all-projects to search every folder")
+finally:
+    if ROOT_SAVE is None:
+        os.environ.pop("RESUME_INTERRUPTED_PROJECTS_ROOT", None)
+    else:
+        os.environ["RESUME_INTERRUPTED_PROJECTS_ROOT"] = ROOT_SAVE
+
+print("\n== v0.8.6: SKILL.md handles a targeted invocation (an argument) FIRST ==")
+skill_md = open(os.path.join(HERE, "..", "skills", "resume-interrupted", "SKILL.md")).read()
+check("argument-hint:" in skill_md.split("---", 2)[1], "SKILL.md frontmatter declares argument-hint")
+tgt = skill_md.find("## Targeted invocation")
+check(0 < tgt < skill_md.find("## How to recognize"),
+      "the targeted-invocation section comes before the detection/listing material")
+check("$ARGUMENTS" in skill_md, "SKILL.md reads the invocation arguments")
+
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

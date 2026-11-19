@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.8.6] — 2026-11-19
+
+### Fixed — targeted resume: `tail` argument order, cross-project lookup, skill arguments
+
+- `interrupted`: the subcommand may now come after options. `interrupted --project P tail ID`
+  failed with `unknown argument tail` because only `argv[0]` was checked, while the skill
+  teaches options-first.
+- `interrupted tail <id-prefix>`: when no `--project`/`--dir` is given and the current
+  project's folder has no match, it now searches EVERY project folder (session ids are
+  unique). A prefix that matches in several folders is a loud `ambiguous` error. An explicit
+  `--project`/`--dir` stays strict, and `tail --all-projects` skips straight to all folders.
+- `SKILL.md`: new `argument-hint` and a "Targeted invocation" section before everything else.
+  `/resume-interrupted <id>` resumes THAT session via `interrupted tail <id>`, with no list,
+  `recommended` or candidate picker (a real case resumed the wrong, "recommended" session).
+  Also documents the CLI shape and what an `unknown argument` error means on old copies.
+- `portable/` rebuilt.
+
 ## [0.8.5] — 2026-11-16
 
 ### Fixed — pyright clean (0 errors repo-wide)
